@@ -7,7 +7,7 @@ DB_PASS = ''
 DB_HOST = 'localhost'
 DB_PORT = 3306
 DB_NAME = 'mattel'
-EXCEL_FILE = 'DONNEES_MATTEL.xlsx'
+EXCEL_FILE = 'NEW_DONNEES_MATTEL.xlsx'
 
 # Create SQLAlchemy engine
 engine = create_engine(
@@ -16,8 +16,8 @@ engine = create_engine(
 )
 
 # === 1) Load Excel sheets ===
-df = pd.read_excel(EXCEL_FILE, sheet_name='DONNEES ')
-df_offers = pd.read_excel(EXCEL_FILE, sheet_name='NOM DES OFFRES ')
+df = pd.read_excel(EXCEL_FILE, sheet_name='DONNEES')
+df_offers = pd.read_excel(EXCEL_FILE, sheet_name='NOM DES OFFRES')
 print(f"Loaded {len(df)} records from main sheet and {len(df_offers)} records from offers sheet.")
 
 with engine.begin() as conn:
