@@ -1,112 +1,90 @@
+# ==============================================================================
+# 1. IMPORTS & INITIAL SETUP
+# ==============================================================================
 import os
-from flask import Flask, render_template, jsonify, request, session, redirect, url_for, flash
-from flask_cors import CORS
-from flask_caching import Cache
-import pandas as pd
-from datetime import datetime, timedelta
 import json
+import secrets
+import string
+import logging
+import smtplib
+from functools import wraps
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import pandas as pd
 import plotly
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import mysql.connector
+
+from flask import Flask, render_template, jsonify, request, session, redirect, url_for, flash
+from flask_cors import CORS
+from flask_caching import Cache
+from sqlalchemy import create_engine, text
 from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
-import secrets
-import string
-from sqlalchemy import create_engine
+import mysql.connector  # Keep this for direct connection in auth functions if needed, though SQLAlchemy is preferred
 from sqlalchemy.exc import IntegrityError  # Import IntegrityError for specific error handling
-from sqlalchemy import text
-import re
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import smtplib
-import logging
-logging.basicConfig(level=logging.INFO)
+import re  # Added for potential email validation, though not directly used in provided snippets
 
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USER = '23612@isms.esp.mr'
-EMAIL_PASSWORD = 'Lalle23612'
-EMAIL_FROM = '23612@isms.esp.mr'
-APP_BASE_URL = 'http://127.0.0.1:5000'
+# Basic logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Flask Application Initialization and Configuration ---
+# ==============================================================================
+# 2. FLASK APPLICATION CONFIGURATION
+# ==============================================================================
+# For local development, create a file named .env in the root directory
+# and add your secret values there. Example:
+#
+# SECRET_KEY=your_super_secret_key
+# DATABASE_PASSWORD=your_db_password
+# EMAIL_USER=your_email@example.com
+# EMAIL_PASSWORD=your_email_app_password
 
 app = Flask(__name__)
 
-# Set max upload size to 100 MB (adjust as needed) - Increased for "Request Entity Too Large" error
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 megabytes
+# --- Core App Configuration ---
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a-default-secret-key-that-you-should-change')
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
 
-# Enable Cross-Origin Resource Sharing (CORS) for all routes.
-# This is crucial for allowing your frontend (running on a different origin/port)
-# to make requests to this Flask backend.
-CORS(app)
+# --- Database Configuration (from environment variables) ---
+DB_HOST = os.getenv('DATABASE_HOST', 'localhost')
+DB_USER = os.getenv('DATABASE_USER', 'root')
+DB_PASSWORD = os.getenv('DATABASE_PASSWORD', 'SidiAmar23635')  # Default for convenience
+DB_NAME = os.getenv('DATABASE_NAME', 'mattel')
 
-# Configure Flask-Caching for API endpoint responses.
-# 'CACHE_TYPE': 'simple' uses a basic in-memory cache.
-# Caching improves performance by storing the results of expensive database queries
-# and serving them directly from memory for subsequent identical requests,
-# reducing the load on the database.
-cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+# SQLAlchemy Database URI for robust Pandas integration
+# IMPORTANT: The advanced queries in this app require MySQL 8.0 or higher.
+app.config['SQLALCHEMY_DATABASE_URI'] = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
 
-# Load application configuration from environment variables or provide defaults.
-# This makes the application more flexible and secure, as sensitive
-# information like database credentials are not hardcoded directly in the script.
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-this-in-production')
-app.config.update({
-    'DATABASE_HOST': os.getenv('DATABASE_HOST', 'localhost'),
-    'DATABASE_USER': os.getenv('DATABASE_USER', 'root'),
-    'DATABASE_PASSWORD': os.getenv('DATABASE_PASSWORD', 'SidiAmar23635'),
-    'DATABASE_NAME': os.getenv('DATABASE_NAME', 'mattel'),
-    'CACHE_TIMEOUT': int(os.getenv('CACHE_TIMEOUT', '300'))  # Cache timeout in seconds (e.g., 300s = 5 minutes)
-})
+# --- Caching Configuration ---
+app.config['CACHE_TYPE'] = 'SimpleCache'  # Simple in-memory cache
+app.config['CACHE_DEFAULT_TIMEOUT'] = 300  # Default cache timeout: 5 minutes
+cache = Cache(app)
 
-# Store database configuration in a dictionary for easy access
+# --- Email Configuration (from environment variables) ---
+app.config['EMAIL_HOST'] = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+app.config['EMAIL_PORT'] = int(os.getenv('EMAIL_PORT', 587))
+app.config['EMAIL_USER'] = os.getenv('EMAIL_USER', '23612@isms.esp.mr')  # Default for convenience
+app.config['EMAIL_PASSWORD'] = os.getenv('EMAIL_PASSWORD', 'Lalle23612')  # Default for convenience
+app.config['EMAIL_FROM'] = os.getenv('EMAIL_FROM', 'no-reply@mattel.com')
+app.config['APP_BASE_URL'] = os.getenv('APP_BASE_URL', 'http://127.0.0.1:5000')
+
+# Store database configuration in a dictionary for direct mysql.connector usage (e.g., auth functions)
+# FIXED: Use the DB_* variables directly, as they are already populated from os.getenv.
+# This prevents KeyError as app.config does not explicitly store these values.
 DATABASE_CONFIG = {
-    'host': app.config['DATABASE_HOST'],
-    'user': app.config['DATABASE_USER'],
-    'password': app.config['DATABASE_PASSWORD'],
-    'database': app.config['DATABASE_NAME']
+    'host': DB_HOST,
+    'user': DB_USER,
+    'password': DB_PASSWORD,
+    'database': DB_NAME
 }
 
 # Retrieve cache timeout from app config
-cache_timeout = app.config['CACHE_TIMEOUT']
+cache_timeout = app.config['CACHE_DEFAULT_TIMEOUT']
 
-# Moved email_utils to directly within app.py or ensure it's imported
-# from email_utils.email_config import send_email, create_and_send_invitation_email, generate_random_password
-
-def send_email(to_email, subject, body, is_html=True):
-    msg = MIMEMultipart('alternative')
-    msg['From'] = f"Plateforme de Partage  de cours et resources Mangement system<{EMAIL_FROM}>"
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg['Reply-To'] = EMAIL_FROM
-
-    # Add plain text version
-    plain_text = f"""
-    {subject}
-
-    {body}
-
-    This is an automated message, please do not reply.
-    """
-
-    msg.attach(MIMEText(plain_text, 'plain'))
-    if is_html:
-        msg.attach(MIMEText(body, 'html'))
-
-    try:
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as smtp:
-            smtp.starttls()
-            smtp.login(EMAIL_USER, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print("Email sent successfully!")
-        return True
-    except Exception as e:
-        print(f"Email sending failed: {e}")
-        return False
-# --- Core Helper Functions (Database, Plotly, Authentication) ---
+# --- Initialize Extensions ---
+CORS(app)
 
 # Global SQLAlchemy engine to be created once
 db_engine = None
@@ -121,48 +99,60 @@ def get_db_engine():
     if db_engine is None:
         try:
             # Construct the database URI for SQLAlchemy
-            # Ensure mysqlclient is installed for better performance with SQLAlchemy
-            # pip install mysqlclient # or pip install mysql-connector-python
-            db_uri = (
-                f"mysql+mysqlconnector://{DATABASE_CONFIG['user']}:"
-                f"{DATABASE_CONFIG['password']}@{DATABASE_CONFIG['host']}/"
-                f"{DATABASE_CONFIG['database']}"
-            )
+            db_uri = app.config['SQLALCHEMY_DATABASE_URI']
             db_engine = create_engine(db_uri)
-            print("SQLAlchemy engine created successfully.")
+            app.logger.info("SQLAlchemy engine created successfully.")
         except Exception as e:
-            print(f"Error creating SQLAlchemy engine: {e}")
+            app.logger.error(f"Error creating SQLAlchemy engine: {e}", exc_info=True)
             db_engine = None  # Ensure engine is None if creation fails
     return db_engine
 
 
-def query_to_dataframe(query, params=None):
-    """
-    Executes a SQL query using an SQLAlchemy engine and returns the results as a Pandas DataFrame.
-    This function is a wrapper to simplify database interactions and improve compatibility
-    with complex SQL queries like CTEs and Window Functions (requires MySQL 8.0+).
-    """
+# ==============================================================================
+# 3. CORE HELPER & UTILITY FUNCTIONS
+# ==============================================================================
+
+def query_to_dataframe(query: str, params: dict = None) -> pd.DataFrame:
+    """Executes a SQL query using the global engine and returns a Pandas DataFrame."""
     engine = get_db_engine()
     if engine:
         try:
-            # Use pd.read_sql_query with the SQLAlchemy engine
-            # Parameters are passed directly to read_sql_query for sanitization
             df = pd.read_sql_query(sql=query, con=engine, params=params)
             return df
         except Exception as e:
-            print(f"Error executing query: {e}")
-            print(f"Query: {query}")
-            return pd.DataFrame()  # Return empty DataFrame on query execution error
-    return pd.DataFrame()  # Return empty DataFrame if engine creation fails
+            app.logger.error(f"Error executing query: {e}\nQuery: {query}", exc_info=True)
+            return pd.DataFrame()
+    app.logger.error("Database engine not initialized. Cannot execute query.")
+    return pd.DataFrame()
 
 
-def create_figure_json(fig):
-    """
-    Converts a Plotly figure object into a JSON string.
-    This JSON string can then be sent to the frontend and parsed by Plotly.js
-    to render the chart.
-    """
+def create_figure_json(fig: go.Figure) -> str:
+    """Converts a Plotly figure to a JSON string for frontend rendering."""
     return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+
+def send_email(to_email: str, subject: str, body_html: str):
+    """Sends an HTML email using configured settings."""
+    if not all([app.config['EMAIL_USER'], app.config['EMAIL_PASSWORD']]):
+        app.logger.warning("Email credentials not set in environment. Skipping email sending.")
+        return False
+
+    msg = MIMEMultipart('alternative')
+    msg['From'] = f"Mattel Analytics <{app.config['EMAIL_FROM']}>"
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body_html, 'html'))
+
+    try:
+        with smtplib.SMTP(app.config['EMAIL_HOST'], app.config['EMAIL_PORT']) as smtp:
+            smtp.starttls()
+            smtp.login(app.config['EMAIL_USER'], app.config['EMAIL_PASSWORD'])
+            smtp.send_message(msg)
+        app.logger.info(f"Email sent successfully to {to_email}")
+        return True
+    except Exception as e:
+        app.logger.error(f"Email sending to {to_email} failed: {e}", exc_info=True)
+        return False
 
 
 def generate_verification_token():
@@ -170,249 +160,173 @@ def generate_verification_token():
     return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(50))
 
 
+@app.template_filter('format_number')
+def format_number_filter(value):
+    """Jinja2 filter to format numbers with commas for display in templates."""
+    try:
+        num_value = float(value)
+        # Format floats with 2 decimal places, integers without
+        if isinstance(value, float) and value % 1 != 0:  # Check if it's a float with decimal part
+            return f"{num_value:,.1f}"
+        return f"{int(num_value):,}"
+    except (ValueError, TypeError):
+        return value
+
+
+# ==============================================================================
+# 4. AUTHENTICATION & USER MANAGEMENT
+# ==============================================================================
+
+# --- Auth Decorators ---
+
 def login_required(f):
-    """Decorator to require login for protected routes"""
+    """Decorator to protect routes that require a logged-in user."""
 
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'employee_id' not in session:
-            return jsonify({'error': 'Authentication required'}), 401
+            # For API calls, return JSON. For page loads, redirect.
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return jsonify({'error': 'Authentication required', 'redirect': url_for('login')}), 401
+            flash("You must be logged in to view this page.", "info")
+            return redirect(url_for('login'))
         return f(*args, **kwargs)
 
     return decorated_function
 
 
 def admin_required(f):
-    """Decorator to require admin role for protected routes"""
+    """Decorator to protect routes that require an admin user."""
 
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # First, ensure user is logged in
         if 'employee_id' not in session:
-            return jsonify({'error': 'Authentication required'}), 401
+            flash("You must be logged in to view this page.", "info")
+            return redirect(url_for('login'))
+        # Then, check for admin role
         if session.get('role_name') != 'admin':
-            return jsonify({'error': 'Admin access required'}), 403
+            flash("Admin access is required to view this page.", "danger")
+            return redirect(url_for('dashboard'))
         return f(*args, **kwargs)
 
     return decorated_function
 
 
-def get_employee_by_email(email):
-    """Get employee information by email"""
-    query = """
-    SELECT e.employee_id, e.employee_gmail, e.password_hash, e.is_active,
-           e.is_email_verified, r.role_name, r.role_id
-    FROM employees e
-    JOIN roles r ON e.role_id = r.role_id
-    WHERE e.employee_gmail = %s
-    """
+# --- Auth Helper Functions ---
 
-    conn = None  # Initialize conn to None
-    try:
-        conn = mysql.connector.connect(**DATABASE_CONFIG)  # Use direct connector for auth operations
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(query, (email,))
-        result = cursor.fetchone()
-        return result
-    except Exception as e:
-        print(f"Error getting employee: {e}")
+def get_employee_by_email(email: str) -> dict:
+    """Retrieves an employee's details from the database by their email using SQLAlchemy."""
+    query = text("""
+        SELECT e.employee_id, e.employee_gmail, e.password_hash, e.is_active, e.is_email_verified, r.role_name, r.role_id
+        FROM employees e JOIN roles r ON e.role_id = r.role_id
+        WHERE e.employee_gmail = :email
+    """)
+    engine = get_db_engine()
+    if not engine:
+        app.logger.error("Database engine not available for get_employee_by_email.")
         return None
-    finally:
-        if conn and conn.is_connected():  # Check if conn is not None before closing
-            conn.close()
-    return None
+    with engine.connect() as conn:
+        result = conn.execute(query, {'email': email}).mappings().fetchone()
+    return result
 
 
-def create_employee(email, password, phone=None, role_name='employee'):
-    """Create a new employee account with inactive status and verification token"""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DATABASE_CONFIG)
-        cursor = conn.cursor()
+def create_employee(email: str, password: str, phone: str = None, role_name='employee') -> (bool, str):
+    """Creates a new, inactive employee account."""
+    if get_employee_by_email(email):
+        return False, "An account with this email already exists."
 
-        # Get role_id from roles table
-        cursor.execute("SELECT role_id FROM roles WHERE role_name = %s", (role_name,))
-        role_result = cursor.fetchone()
-        if not role_result:
-            return False, "Invalid role"
+    password_hash = generate_password_hash(password)
+    verification_token = secrets.token_urlsafe(32)
+    token_expires = datetime.now() + timedelta(hours=24)
 
-        role_id = role_result[0]
-        password_hash = generate_password_hash(password)
-        verification_token = generate_verification_token()
-        token_expires = datetime.now() + timedelta(hours=24)
+    engine = get_db_engine()
+    if not engine:
+        return False, "Database connection not available."
 
-        # Build query
-        query = """
-        INSERT INTO employees (
-            employee_gmail,
-            employee_phone,
-            password_hash,
-            role_id,
-            is_active,
-            email_verification_token,
-            email_verification_token_expires_at,
-            is_email_verified,
-            created_at,
-            updated_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-        """
-        cursor.execute(query, (
-            email,
-            phone,
-            password_hash,
-            role_id,
-            False,  # Account not active by default
-            verification_token,
-            token_expires,
-            False  # Email not verified yet
-        ))
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            role_query = text("SELECT role_id FROM roles WHERE role_name = :role_name")
+            role_id = conn.execute(role_query, {'role_name': role_name}).scalar()
+            if not role_id:
+                return False, f"Default '{role_name}' role not found in database."
 
-        conn.commit()
-        return True, "Account created successfully. Please wait for admin approval."
-    except mysql.connector.IntegrityError:
-        return False, "Email already exists"
-    except Exception as e:
-        print(f"Error creating employee: {e}")
-        return False, "Failed to create account"
-    finally:
-        if conn and conn.is_connected():
-            conn.close()
+            insert_query = text("""
+                INSERT INTO employees (employee_gmail, employee_phone, password_hash, role_id, is_active, email_verification_token, email_verification_token_expires_at, is_email_verified, created_at, updated_at)
+                VALUES (:email, :phone, :p_hash, :role_id, FALSE, :token, :expires, FALSE, NOW(), NOW())
+            """)
+            conn.execute(insert_query, {
+                'email': email, 'phone': phone, 'p_hash': password_hash, 'role_id': role_id,
+                'token': verification_token, 'expires': token_expires
+            })
+            trans.commit()
+            return True, "Account created. Please wait for an administrator to activate it."
+        except Exception as e:
+            trans.rollback()
+            app.logger.error(f"Error creating employee {email}: {e}", exc_info=True)
+            return False, "Failed to create account due to a database error."
 
 
-
-def generate_time_series_chart(df, x_col, y_cols, title, labels=None):
-    """
-    A generic helper function to create time series charts using Plotly.
-    It supports plotting multiple Y-axis columns and an optional secondary Y-axis
-    if one of the Y-columns contains 'amount' in its name (for common usage/revenue metrics).
-
-    Args:
-        df (pandas.DataFrame): The DataFrame containing the time series data.
-        x_col (str): The name of the column to use for the X-axis (time).
-        y_cols (list of str): A list of column names to plot on the Y-axis.
-        title (str): The title of the chart.
-        labels (dict, optional): A dictionary mapping column names to display labels.
-                                 Defaults to None.
-
-    Returns:
-        str: A JSON string representation of the Plotly figure.
-    """
-    # Create a subplot figure, potentially with a secondary Y-axis
-    fig = make_subplots(specs=[[{"secondary_y": any('amount' in col.lower() for col in y_cols)}]])
-
-    for i, y_col in enumerate(y_cols):
-        # Add each Y-column as a scatter trace (line chart)
-        fig.add_trace(
-            go.Scatter(x=df[x_col], y=df[y_col], name=labels[y_col] if labels and y_col in labels else y_col),
-            # Assign to secondary Y-axis if 'amount' is in the column name and it's not the first trace
-            secondary_y=('amount' in y_col.lower()) if i > 0 else False,
-        )
-
-    # Update layout with title and X-axis label
-    fig.update_layout(title_text=title, xaxis_title=labels.get(x_col, x_col) if labels else x_col)
-    # Update primary Y-axis label
-    fig.update_yaxes(title_text=labels.get(y_cols[0], y_cols[0]) if labels else y_cols[0], secondary_y=False)
-
-    # If there's more than one Y-column, update the secondary Y-axis label if applicable
-    if len(y_cols) > 1:
-        if 'amount' in y_cols[1].lower():
-            fig.update_yaxes(title_text=labels.get(y_cols[1], y_cols[1]) if labels else y_cols[1], secondary_y=True)
-
-    return create_figure_json(fig)
-
-
-# --- Authentication and Base Routes ---
+# --- Authentication Routes ---
 
 @app.route('/auth/signup', methods=['GET', 'POST'])
 def signup():
-    """Employee signup page and handler"""
-    if request.method == 'GET':
-        # Corrected template name
-        return render_template('pages-sign-up.html')
-
-    try:
+    if request.method == 'POST':
         data = request.get_json() if request.is_json else request.form
         email = data.get('email', '').strip().lower()
         password = data.get('password', '')
         confirm_password = data.get('confirm_password', '')
 
-        # Basic validation
-        if not email or not password:
-            return jsonify({'error': 'Email and password are required'}), 400
+        if not email or len(password) < 8 or password != confirm_password:
+            return jsonify({'error': 'Please provide a valid email and matching passwords (min 8 chars).'}), 400
 
-        if password != confirm_password:
-            return jsonify({'error': 'Passwords do not match'}), 400
-
-        if len(password) < 6:
-            return jsonify({'error': 'Password must be at least 6 characters'}), 400
-
-        # Create employee account
         success, message = create_employee(email, password)
-
         if success:
-            return jsonify({'message': message, 'redirect': '/auth/login'}), 201
+            return jsonify({'message': message, 'redirect': url_for('login')}), 201
         else:
             return jsonify({'error': message}), 400
-
-    except Exception as e:
-        print(f"Signup error: {e}")
-        return jsonify({'error': 'An error occurred during signup'}), 500
+    return render_template('pages-sign-up.html')
 
 
 @app.route('/auth/login', methods=['GET', 'POST'])
 def login():
-    """Employee login page and handler"""
-    if request.method == 'GET':
-        # Corrected template name
-        return render_template('pages-sign-in.html')
-
-    try:
+    if request.method == 'POST':
         data = request.get_json() if request.is_json else request.form
         email = data.get('email', '').strip().lower()
         password = data.get('password', '')
 
-        if not email or not password:
-            return jsonify({'error': 'Email and password are required'}), 400
-
-        # Get employee from database
         employee = get_employee_by_email(email)
-
-        if not employee:
-            return jsonify({'error': 'Invalid email or password'}), 401
-
+        if not employee or not check_password_hash(employee['password_hash'], password):
+            return jsonify({'error': 'Invalid email or password.'}), 401
         if not employee['is_active']:
-            return jsonify({'error': 'Account is deactivated'}), 401
+            return jsonify({'error': 'This account is not active. Please contact an administrator.'}), 403
 
-        # Check password
-        if not check_password_hash(employee['password_hash'], password):
-            return jsonify({'error': 'Invalid email or password'}), 401
-
-        # Create session
+        session.clear()
         session['employee_id'] = employee['employee_id']
         session['employee_email'] = employee['employee_gmail']
         session['role_name'] = employee['role_name']
         session['is_email_verified'] = employee['is_email_verified']
-        session['role_id'] = employee['role_id']
-
-        return jsonify({
-            'message': 'Login successful',
-            'redirect': '/dashboard',
-            'user': {
-                'email': employee['employee_gmail'],
-                'role': employee['role_name']
-            }
-        }), 200
-
-    except Exception as e:
-        print(f"Login error: {e}")
-        return jsonify({'error': 'An error occurred during login'}), 500
+        session['role_id'] = employee['role_id']  # Store role_id for admin checks
+        app.logger.info(f"User {email} logged in successfully.")
+        return jsonify({'message': 'Login successful', 'redirect': url_for('dashboard')}), 200
+    return render_template('pages-sign-in.html')
 
 
 @app.route('/auth/logout', methods=['POST'])
+@login_required
 def logout():
-    """Employee logout"""
     session.clear()
-    return jsonify({'message': 'Logged out successfully', 'redirect': '/auth/login'}), 200
+    return jsonify({'message': 'Logged out successfully', 'redirect': url_for('login')}), 200
+
+
+@app.route('/auth/check')
+def check_auth_status():
+    """Endpoint for the frontend to check if a user is currently authenticated."""
+    if 'employee_id' in session:
+        return jsonify(
+            {'authenticated': True, 'user': {'email': session.get('employee_email'), 'role': session.get('role_name')}})
+    return jsonify({'authenticated': False})
 
 
 @app.route('/auth/profile')
@@ -427,42 +341,24 @@ def profile():
     })
 
 
-@app.route('/auth/check')
-def check_auth():
-    """Check if user is authenticated"""
-    if 'employee_id' not in session:  # Removed redundant check for 'employee_id' presence
-        return jsonify({'authenticated': False})
-    # If employee_id is in session, retrieve user info and return authenticated
-    employee_id = session['employee_id']
-    employee_email = session['employee_email']
-    role_name = session['role_name']
-    return jsonify({
-        'authenticated': True,
-        'user': {
-            'email': employee_email,
-            'role': role_name
-        }
-    })
-
+# ==============================================================================
+# 5. CORE APPLICATION & DASHBOARD ROUTES
+# ==============================================================================
 
 @app.route('/')
 def index():
-    """Redirect to dashboard if logged in, otherwise to login"""
-    if 'employee_id' in session:
-        # Redirect to the main protected dashboard route
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('login'))
+    """Redirects to the appropriate page based on login status."""
+    return redirect(url_for('dashboard')) if 'employee_id' in session else redirect(url_for('login'))
 
 
 @app.route('/dashboard')
-@login_required  # This dashboard now requires login
+@login_required
 def dashboard():
     """
-    Main dashboard route.
-    Fetches overall KPI data and renders the main dashboard template.
+    Renders the main dashboard shell. Data is loaded asynchronously by JavaScript
+    calling the /api/kpi_summary endpoint.
     """
-    # Fetch overall stats directly here or call the API endpoint internally
-    # For simplicity, let's re-calculate totals needed by the template
+    # Fetch overall stats directly here for initial render of template KPI cards
     # Query for total revenue, charges, operations
     query_kpis = "SELECT SUM(deduct_amount) as total_revenue, SUM(charge_amount) as total_charges, COUNT(*) as number_of_operations FROM cdr_events"
     df_kpis = query_to_dataframe(query_kpis)
@@ -477,28 +373,28 @@ def dashboard():
 
     # Extract values, handling potential None from empty tables
     total_revenue = 0
-    if not df_kpis.empty and df_kpis['total_revenue'].iloc[0] is not None:
+    if not df_kpis.empty and pd.notna(df_kpis['total_revenue'].iloc[0]):
         total_revenue = int(df_kpis['total_revenue'].iloc[0])
 
     total_charges = 0
-    if not df_kpis.empty and df_kpis['total_charges'].iloc[0] is not None:
+    if not df_kpis.empty and pd.notna(df_kpis['total_charges'].iloc[0]):
         total_charges = int(df_kpis['total_charges'].iloc[0])
 
     total_deducted = total_revenue  # Assuming total_deducted is same as total_revenue from usage
 
     number_of_operations = 0
-    if not df_kpis.empty:
+    if not df_kpis.empty and pd.notna(df_kpis['number_of_operations'].iloc[0]):
         number_of_operations = int(df_kpis['number_of_operations'].iloc[0])
 
     active_customers = 0
-    if not df_active_customers.empty and df_active_customers['active_customers_year'].iloc[0] is not None:
+    if not df_active_customers.empty and pd.notna(df_active_customers['active_customers_year'].iloc[0]):
         active_customers = int(df_active_customers['active_customers_year'].iloc[0])
 
     # Calculate ARPU (requires total_revenue and total_customers from 'customers' table)
     query_total_customers = "SELECT COUNT(*) as total_customers FROM customers"
     df_total_customers = query_to_dataframe(query_total_customers)
     total_customers_overall = 0
-    if not df_total_customers.empty:
+    if not df_total_customers.empty and pd.notna(df_total_customers['total_customers'].iloc[0]):
         total_customers_overall = int(df_total_customers['total_customers'].iloc[0])
 
     arpu = total_revenue / total_customers_overall if total_customers_overall > 0 else 0.0
@@ -506,120 +402,97 @@ def dashboard():
     # Pass the role_name and all KPI values to the template
     user_role = session.get('role_name')
 
-    return render_template('INDEX22.html',
-                           page_title="Mattel Analytics Dashboard",
-                           current_year=datetime.now().year,
-                           user_role=user_role,
-                           total_revenue=total_revenue,
-                           total_charges=total_charges,
-                           total_deducted=total_deducted,
-                           number_of_operations=number_of_operations,
-                           active_customers=active_customers,  # Passed to template
-                           arpu=arpu  # Passed to template
-                           )
+    return render_template(
+        'INDEX22.html',
+        page_title="Mattel Analytics Dashboard",
+        current_year=datetime.now().year,
+        user_role=user_role,
+        total_revenue=total_revenue,
+        total_charges=total_charges,
+        total_deducted=total_deducted,
+        number_of_operations=number_of_operations,
+        active_customers=active_customers,
+        arpu=arpu
+    )
 
 
-@app.template_filter('format_number')
-def format_number_filter(value):
-    """Jinja2 filter to format numbers with commas."""
-    try:
-        # Ensure value is convertible to a number before formatting
-        num_value = float(value)
-        # For ARPU, keep one decimal place, otherwise format as integer
-        if isinstance(value, float) and value % 1 != 0:  # Check if it's a float with decimal part
-            return f"{num_value:,.1f}"
-        return f"{int(num_value):,}"
-    except (ValueError, TypeError):
-        return value
-
-
-@app.route('/api/kpi_summary')
-@login_required  # Ensure user is logged in to access this
-@cache.cached(timeout=cache_timeout)  # Add caching for this API
-def kpi_summary():
+@app.route('/analytics_modules')
+@login_required
+def analytics_modules_page():
     """
-    API endpoint to provide a summary of key performance indicators (KPIs).
-    This is designed to be called by the frontend to populate KPI cards.
+    Renders the analytics modules shell. All charts are loaded asynchronously
+    by JavaScript making calls to the various /api/... endpoints. This makes the
+    initial page load very fast.
     """
-    stats = {}
+    user_role = session.get('role_name')
 
-    total_customers_query = "SELECT COUNT(*) as total_customers FROM customers"
-    df_total_customers = query_to_dataframe(total_customers_query)
-    total_customers = 0
-    if not df_total_customers.empty:
-        total_customers = int(df_total_customers['total_customers'].iloc[0])
-    stats['total_customers'] = total_customers
+    # Fetch data from all relevant API endpoints
+    # Use .get('chart', '') to safely retrieve chart data, defaulting to an empty string if None or missing
+    # And .get('data', []) for table data, defaulting to an empty list
+    overall_stats_response = overall_stats().json
+    offers_summary_response = offers_summary().json
+    offer_performance_response = offer_performance().json
+    offer_trend_analysis_response = offer_trend_analysis().json
+    data_bundle_analysis_response = data_bundle_analysis().json
+    cross_offer_analysis_response = cross_offer_analysis().json
+    revenue_analysis_response = revenue_analysis().json
+    revenue_trends_by_customer_type_response = revenue_trends_by_customer_type().json
+    arpu_analysis_response = arpu_analysis().json
+    balance_flow_analysis_response = balance_flow_analysis().json
+    loan_analysis_response = loan_analysis().json
+    operations_breakdown_response = operations_breakdown().json
+    object_types_analysis_response = object_types_analysis().json
+    time_series_analysis_response = time_series_analysis().json
+    usage_patterns_by_time_response = usage_patterns_by_time().json
+    expiry_forecast_response = expiry_forecast().json
+    expiry_impact_analysis_response = expiry_impact_analysis().json
+    network_capacity_analysis_response = network_capacity_analysis().json
+    data_quality_report_response = data_quality_report().json
+    churn_analysis_response = churn_analysis().json
+    churn_risk_analysis_response = churn_risk_analysis().json
+    seasonal_usage_prediction_response = seasonal_usage_prediction().json
+    next_offer_recommendation_response = next_offer_recommendation().json
+    customer_type_distribution_response = customer_type_distribution().json
+    customer_spending_segments_response = customer_spending_segments().json
+    customer_behavior_by_type_response = customer_behavior_by_type().json
+    customer_offer_preferences_response = customer_offer_preferences().json
+    customer_lifecycle_analysis_response = customer_lifecycle_analysis().json
+    customer_journey_analysis_response = customer_journey_analysis().json
 
-    total_cdr_events_query = "SELECT COUNT(*) as total_events FROM cdr_events"
-    df_total_events = query_to_dataframe(total_cdr_events_query)
-    total_cdr_events = 0
-    if not df_total_events.empty:
-        total_cdr_events = int(df_total_events['total_events'].iloc[0])
-    stats['total_cdr_events'] = total_cdr_events
-
-    total_revenue_query = """
-    SELECT IFNULL(SUM(deduct_amount), 0) as total_revenue
-    FROM cdr_events
-    WHERE operation_type_id IN (1, 2, 3)
-    """
-    df_total_revenue = query_to_dataframe(total_revenue_query)
-    total_revenue = 0.0
-    if not df_total_revenue.empty:
-        total_revenue = float(df_total_revenue['total_revenue'].iloc[0])
-    stats['total_revenue'] = total_revenue
-
-    total_charges_query = "SELECT IFNULL(SUM(charge_amount), 0) as total_charges FROM cdr_events"
-    df_total_charges = query_to_dataframe(total_charges_query)
-    total_charges = 0.0
-    if not df_total_charges.empty:
-        total_charges = float(df_total_charges['total_charges'].iloc[0])
-    stats['total_charges'] = total_charges
-
-    active_customers_year_query = """
-    SELECT COUNT(DISTINCT cust_num) as active_customers_year
-    FROM cdr_events
-    WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
-    """
-    df_active_customers_year = query_to_dataframe(active_customers_year_query)
-    active_customers_year = 0
-    if not df_active_customers_year.empty:
-        active_customers_year = int(df_active_customers_year['active_customers_year'].iloc[0])
-    stats['active_customers_year'] = active_customers_year
-
-    arpu = total_revenue / total_customers if total_customers > 0 else 0.0
-
-    summary = {
-        'total_revenue': total_revenue,
-        'total_charges': total_charges,
-        'total_deducted': total_revenue,  # Assuming total_deducted is same as total_revenue from usage
-        'number_of_operations': total_cdr_events,
-        'active_customers': active_customers_year,
-        'arpu': arpu
-    }
-    return jsonify(summary)
-
-
-@app.route('/admin/reset_analysis', methods=['POST'])
-@admin_required
-def reset_analysis():
-    """
-    Admin endpoint to reset (truncate) the cdr_events table.
-    WARNING: This operation is destructive and deletes all data in cdr_events.
-    Use with extreme caution, especially in non-development environments.
-    """
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DATABASE_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("TRUNCATE TABLE cdr_events")
-        conn.commit()
-        return jsonify({'message': 'Analysis data reset successfully'}), 200
-    except Exception as e:
-        print(f"Error resetting analysis data: {e}")  # Log the error
-        return jsonify({'error': str(e)}), 500
-    finally:
-        if conn and conn.is_connected():
-            conn.close()
+    return render_template(
+        'analytics_modules.html',
+        user_role=user_role,
+        page_title="Analytics Modules",
+        overall_stats=overall_stats_response,
+        offers_summary=offers_summary_response,
+        offer_performance=offer_performance_response,
+        offer_trend_analysis=offer_trend_analysis_response,
+        data_bundle_analysis=data_bundle_analysis_response,
+        cross_offer_analysis=cross_offer_analysis_response,
+        revenue_analysis=revenue_analysis_response,
+        revenue_trends_by_customer_type=revenue_trends_by_customer_type_response,
+        arpu_analysis=arpu_analysis_response,
+        balance_flow_analysis=balance_flow_analysis_response,
+        loan_analysis=loan_analysis_response,
+        operations_breakdown=operations_breakdown_response,
+        object_types_analysis=object_types_analysis_response,
+        time_series_analysis=time_series_analysis_response,
+        usage_patterns_by_time=usage_patterns_by_time_response,
+        expiry_forecast=expiry_forecast_response,
+        expiry_impact_analysis=expiry_impact_analysis_response,
+        network_capacity_analysis=network_capacity_analysis_response,
+        data_quality_report=data_quality_report_response,
+        churn_analysis=churn_analysis_response,
+        churn_risk_analysis=churn_risk_analysis_response,
+        seasonal_usage_prediction=seasonal_usage_prediction_response,
+        next_offer_recommendation=next_offer_recommendation_response,
+        customer_type_distribution=customer_type_distribution_response,
+        customer_spending_segments=customer_spending_segments_response,
+        customer_behavior_by_type=customer_behavior_by_type_response,
+        customer_offer_preferences=customer_offer_preferences_response,
+        customer_lifecycle_analysis=customer_lifecycle_analysis_response,
+        customer_journey_analysis=customer_journey_analysis_response
+    )
 
 
 @app.route('/blank')
@@ -628,15 +501,21 @@ def blank():
     return render_template('introduction.html', user_role=session.get('role_name'))
 
 
+@app.route('/settings')
+@login_required
+def settings():
+    return render_template('pages-settings.html', user_role=session.get('role_name'))
 
-# --- DATA SOURCES ROUTES ---
+
+# ==============================================================================
+# 6. ADMIN-ONLY ROUTES
+# ==============================================================================
 
 @app.route("/admin/upload", methods=["GET"])
 @admin_required
 def upload_page():
     """Renders the data upload page."""
     user_role = session.get('role_name')
-    # This route will render the 'uploads.html' template
     return render_template("uploads.html", user_role=user_role)
 
 
@@ -664,7 +543,6 @@ def handle_upload():
     try:
         # Read all necessary sheets from the uploaded Excel file
         xls = pd.ExcelFile(file)
-        # --- FIXED PART ---
         # The 'DESCRIPTION' sheet is a data dictionary and should not be processed for insertion.
         # We only need the data from 'DONNEES' and the offer names from 'NOM DES OFFRES'.
         df_main = pd.read_excel(xls, sheet_name='DONNEES')
@@ -673,7 +551,7 @@ def handle_upload():
     except Exception as e:
         # Update the error message to reflect the needed sheet names
         return jsonify({
-                           'error': f"Error reading Excel file. Make sure sheets 'DONNEES' and 'NOM DES OFFRES' exist. Details: {e}"}), 400
+            'error': f"Error reading Excel file. Make sure sheets 'DONNEES' and 'NOM DES OFFRES' exist. Details: {e}"}), 400
 
     # Using a transaction ensures that if any part of the process fails, all changes are rolled back.
     with engine.connect() as conn:
@@ -695,6 +573,7 @@ def handle_upload():
                 'charge_amount_expire_time': 'charge_expire_time',
                 'curent_amount_expire_time': 'current_amount_expire_time',
                 'operation_type': 'operation_type_id'
+                # Assuming operation_type in excel corresponds to operation_type_id
             }, inplace=True)
             df_offers.rename(columns={"nom de l'offre": 'offer_name', 'offerid': 'offer_id'}, inplace=True)
 
@@ -711,17 +590,32 @@ def handle_upload():
                     """), unique_customers.to_dict(orient='records'))
                     inserted_counts['customers'] = result.rowcount
 
-            # Object Types (from data in your DB schema)
-            # This logic assumes these types are static and populates them if they don't exist.
+            # Object Types (from data in your DB schema) - Insert if they don't exist
             object_type_mapping = {'F': 'Free Resource', 'B': 'Main Balance', 'C': 'Credit Balance'}
-            df_object_types = pd.DataFrame(list(object_type_mapping.items()),
-                                           columns=['object_type_code', 'description'])
-            if not df_object_types.empty:
-                result = conn.execute(text("""
-                    INSERT IGNORE INTO object_types (object_type_code, description)
-                    VALUES (:object_type_code, :description)
-                """), df_object_types.to_dict(orient='records'))
-                inserted_counts['object_types'] = result.rowcount
+            for code, desc in object_type_mapping.items():
+                try:
+                    conn.execute(text("""
+                        INSERT IGNORE INTO object_types (object_type_code, description)
+                        VALUES (:code, :desc)
+                    """), {'code': code, 'desc': desc})
+                    # Use a separate counter for object_types if you want to track ignored vs inserted
+                    # For simplicity, we just count if an insert was attempted
+                except Exception as e:
+                    app.logger.warning(f"Could not insert object_type {code}: {e}. May already exist.")
+            inserted_counts['object_types'] = len(object_type_mapping)  # This is a conceptual count, not actual inserts
+
+            # Operation Types (from data in your DB schema) - Insert if they don't exist
+            operation_type_mapping = {1: 'Purchase', 2: 'Transfer', 3: 'Refund', 4: 'Adjustment', 5: 'Loan',
+                                      6: 'Expiration'}
+            for id, desc in operation_type_mapping.items():
+                try:
+                    conn.execute(text("""
+                        INSERT IGNORE INTO operation_types (operation_type_id, description)
+                        VALUES (:id, :desc)
+                    """), {'id': id, 'desc': desc})
+                except Exception as e:
+                    app.logger.warning(f"Could not insert operation_type {id}: {e}. May already exist.")
+            inserted_counts['operation_types'] = len(operation_type_mapping)
 
             # Offers (from NOM DES OFFRES sheet)
             if not df_offers.empty:
@@ -738,9 +632,13 @@ def handle_upload():
             if 'object_type' in df_main.columns:
                 df_main['object_type_id'] = df_main['object_type'].map(code_to_id_map)
 
-                unique_objects = df_main[
-                    ['object_id', 'cust_num', 'object_type_id', 'current_amount_expire_time']].drop_duplicates().dropna(
-                    subset=['object_id'])
+                # Filter out rows where object_type_id could not be mapped
+                df_main_filtered_objects = df_main.dropna(subset=['object_type_id', 'object_id']).copy()
+
+                unique_objects = df_main_filtered_objects[
+                    ['object_id', 'cust_num', 'object_type_id', 'current_amount_expire_time']
+                ].drop_duplicates().dropna(subset=['object_id'])  # object_id must be present
+
                 unique_objects.rename(columns={
                     'object_id': 'object_id_bigint',
                     'cust_num': 'cust_num_bigint',
@@ -748,6 +646,12 @@ def handle_upload():
                 }, inplace=True)
 
                 if not unique_objects.empty:
+                    # Convert expiry_date to datetime, coercing errors to NaT, then handle NaT
+                    unique_objects['expiry_date'] = pd.to_datetime(unique_objects['expiry_date'], errors='coerce')
+                    # Replace NaT with None or a suitable default for database insertion
+                    unique_objects['expiry_date'] = unique_objects['expiry_date'].apply(
+                        lambda x: x.isoformat() if pd.notna(x) else None)
+
                     result = conn.execute(text("""
                         INSERT IGNORE INTO objects (object_id_bigint, cust_num_bigint, object_type_id, expiry_date)
                         VALUES (:object_id_bigint, :cust_num_bigint, :object_type_id, :expiry_date)
@@ -769,12 +673,62 @@ def handle_upload():
                     df_cdr_to_insert[dt_col] = pd.to_datetime(df_cdr_to_insert[dt_col], errors='coerce').where(
                         pd.notnull(df_cdr_to_insert[dt_col]), None)
 
+            # Ensure integer columns are treated correctly, especially before to_sql
+            int_cols = ['cdr_id', 'cust_num', 'object_id', 'offer_id', 'operation_type_id']
+            for col in int_cols:
+                if col in df_cdr_to_insert.columns:
+                    # Convert to numeric, coerce errors to NaN, then fill NaN with a sentinel like -1 or drop
+                    # For insertion, ensure None for NaN is handled by the database schema or `to_sql`
+                    df_cdr_to_insert[col] = pd.to_numeric(df_cdr_to_insert[col], errors='coerce')
+                    # Convert to Int64 (pandas nullable integer type) to allow NaN/None
+                    df_cdr_to_insert[col] = df_cdr_to_insert[col].astype('Int64')
+
+            # Handle float columns (amounts)
+            float_cols = ['deduct_amount', 'charge_amount', 'current_amount_pre', 'current_amount_post']
+            for col in float_cols:
+                if col in df_cdr_to_insert.columns:
+                    df_cdr_to_insert[col] = pd.to_numeric(df_cdr_to_insert[col], errors='coerce')
+                    df_cdr_to_insert[col] = df_cdr_to_insert[col].fillna(0.0)  # Fill NaN amounts with 0.0
+
             if not df_cdr_to_insert.empty:
-                df_cdr_to_insert.to_sql('cdr_events', con=conn, if_exists='append', index=False, chunksize=1000)
-                inserted_counts['cdr_events'] = len(df_cdr_to_insert)
+                # Use execute directly with a list of dictionaries for performance with sqlalchemy engine
+                # Also, this avoids issues with `to_sql` and `if_exists='append'` when column types mismatch
+                # if the DB schema is strict.
+                # It's better to explicitly build the insert statement and parameters.
+
+                # Filter out rows with NaN in critical columns if they are NOT NULL in DB
+                df_cdr_to_insert.dropna(subset=['cdr_id', 'creation_time', 'cust_num', 'operation_type_id'],
+                                        inplace=True)
+
+                if not df_cdr_to_insert.empty:
+                    # Prepare data for insertion (list of dicts)
+                    cdr_records = df_cdr_to_insert.to_dict(orient='records')
+
+                    # Create a prepared statement
+                    insert_cdr_query = text("""
+                        INSERT IGNORE INTO cdr_events (
+                            cdr_id, creation_time, cust_num, object_id, offer_id,
+                            operation_type_id, deduct_amount, charge_amount,
+                            current_amount_pre, current_amount_post,
+                            charge_expire_time, current_amount_expire_time
+                        ) VALUES (
+                            :cdr_id, :creation_time, :cust_num, :object_id, :offer_id,
+                            :operation_type_id, :deduct_amount, :charge_amount,
+                            :current_amount_pre, :current_amount_post,
+                            :charge_expire_time, :current_amount_expire_time
+                        )
+                    """)
+
+                    # Execute in chunks if the dataframe is very large
+                    chunk_size = 5000
+                    for i in range(0, len(cdr_records), chunk_size):
+                        chunk = cdr_records[i:i + chunk_size]
+                        conn.execute(insert_cdr_query, chunk)
+
+                    inserted_counts['cdr_events'] = len(df_cdr_to_insert)
 
             trans.commit()
-
+            app.logger.info(f"Admin {session['employee_email']} uploaded file. Details: {inserted_counts}")
             return jsonify({
                 'message': 'File processed successfully!',
                 'details': inserted_counts
@@ -782,118 +736,140 @@ def handle_upload():
 
         except Exception as e:
             trans.rollback()
-            logging.error(f"Upload failed: {e}", exc_info=True)
+            app.logger.error(f"Upload failed for admin {session['employee_email']}: {e}", exc_info=True)
             return jsonify({
-                'error': f'An error occurred during database insertion. The transaction has been rolled back. Error: {e}'
+                'error': f'A database error occurred during insertion. The process has been rolled back. Error: {e}'
             }), 500
 
 
 @app.route('/admin/pending_users')
-@login_required
-def admin_pending_users():
-    if session.get('role_id') != 1:
-        flash("Accès refusé", "danger")
-        return redirect(url_for('dashboard'))
-
-    conn = mysql.connector.connect(**DATABASE_CONFIG)
-    cur = conn.cursor()
-    cur.execute("SELECT employee_id, employee_gmail FROM employees WHERE is_active = FALSE")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
-
+@admin_required
+def pending_users():
+    """Shows a list of users pending activation."""
+    query = text("SELECT employee_id, employee_gmail FROM employees WHERE is_active = FALSE")
+    engine = get_db_engine()
+    if not engine:
+        flash("Database connection not available.", "danger")
+        return redirect(url_for('dashboard'))  # Or render an error page
+    with engine.connect() as conn:
+        users = conn.execute(query).mappings().fetchall()
     return render_template("liste_employes.html", users=users, user_role=session.get('role_name'))
 
 
 @app.route('/admin/activate/<int:employee_id>', methods=['POST'])
-@login_required
+@admin_required
 def activate_employee(employee_id):
-    if session.get('role_id') != 1:
-        flash("Accès refusé", "danger")
-        return redirect(url_for('dashboard'))
+    """Activates a user account and sends a notification email."""
+    engine = get_db_engine()
+    if not engine:
+        flash("Database connection not available.", "danger")
+        return redirect(url_for('pending_users'))
 
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            email_query = text("SELECT employee_gmail FROM employees WHERE employee_id = :id")
+            email = conn.execute(email_query, {'id': employee_id}).scalar_one_or_none()
+            if not email:
+                flash("User not found.", "danger")
+                return redirect(url_for('pending_users'))
+
+            update_query = text("UPDATE employees SET is_active = TRUE WHERE employee_id = :id")
+            conn.execute(update_query, {'id': employee_id})
+            trans.commit()
+
+            email_body = "<p>Hello,</p><p>Your account for the Mattel Analytics platform has been activated. You can now log in.</p>"
+            send_email(to_email=email, subject="Your Mattel Analytics Account is Active", body_html=email_body)
+            flash(f"User {email} has been activated successfully.", "success")
+        except Exception as e:
+            trans.rollback()
+            app.logger.error(f"Error activating user {employee_id}: {e}", exc_info=True)
+            flash("An error occurred while activating the account.", "danger")
+    return redirect(url_for('pending_users'))
+
+
+@app.route('/admin/reset_analysis', methods=['POST'])
+@admin_required
+def reset_analysis():
+    """DESTRUCTIVE: Truncates the cdr_events table. Use with extreme caution."""
+    engine = get_db_engine()
+    if not engine:
+        return jsonify({'error': 'Database connection not available.'}), 500
     try:
-        conn = mysql.connector.connect(**DATABASE_CONFIG)
-        cur = conn.cursor()
-
-        # Get employee email before activating
-        cur.execute("SELECT employee_gmail FROM employees WHERE employee_id = %s", (employee_id,))
-        employee = cur.fetchone()
-
-        if employee:
-            email = employee[0]
-
-            # Activate account
-            cur.execute("UPDATE employees SET is_active = TRUE WHERE employee_id = %s", (employee_id,))
-            conn.commit()
-
-            # ✅ Send email
-            send_email(
-                to_email=email,
-                subject="Votre compte a été activé",
-                body=f"""
-Bonjour,
-
-Votre compte Mattel a été activé avec succès. Vous pouvez maintenant vous connecter et utiliser le système.
-
-Cordialement,
-L'équipe Mattel
-"""
-            )
-
-            flash("Employé activé avec succès", "success")
-        else:
-            flash("Utilisateur non trouvé.", "warning")
-
+        with engine.connect() as conn:
+            trans = conn.begin()
+            conn.execute(text("TRUNCATE TABLE cdr_events"))
+            trans.commit()
+        app.logger.warning(f"Admin {session['employee_email']} reset the analysis data (truncated cdr_events).")
+        return jsonify({'message': 'Analysis data has been successfully reset.'}), 200
     except Exception as e:
-        print(f"Erreur d'activation : {e}")
-        flash("Erreur lors de l'activation du compte.", "danger")
-
-    finally:
-        cur.close()
-        conn.close()
-
-    return redirect(url_for('admin_pending_users'))
+        app.logger.error(f"Error resetting analysis data: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
-@app.route('/settings')
-@login_required  # Protect settings route
-def settings():
-    return render_template('pages-settings.html')
+# ==============================================================================
+# 7. API ENDPOINTS (Grouped by Category)
+# ==============================================================================
 
-
-# --- Admin Routes (Re-organized for clarity, already defined above) ---
-# @app.route('/admin/employees')
-# @app.route('/admin/employees/<int:employee_id>/toggle', methods=['POST'])
-# These routes are already defined above the API Endpoints section.
-
-
-# --- Utility Function for Initial Admin Creation (Re-organized for clarity) ---
-# def create_first_admin():
-# This function is already defined above the API Endpoints section.
-
-
-# --- API Endpoints ---
-
-
-""" --- 1. OVERALL SYSTEM HEALTH & KEY PERFORMANCE INDICATORS (KPIs) --- """
-
+# --- API Group: System & Overall Stats ---
 
 @app.route('/api/health')
 def health_check():
-    """
-    API endpoint to check the health of the Flask application and its
-    connection to the MySQL database.
-    Returns a JSON response indicating 'healthy' or 'unhealthy' status.
-    """
+    """Checks API and database health."""
+    engine = get_db_engine()
+    if not engine:
+        return jsonify({'status': 'unhealthy', 'database_error': 'Engine not initialized'}), 500
     try:
-        conn = mysql.connector.connect(**DATABASE_CONFIG)  # Use direct connector for health check
-        if conn:
-            conn.close()
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))  # Simple query to check connection
             return jsonify({'status': 'healthy', 'database': 'connected'})
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
     except Exception as e:
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+        return jsonify({'status': 'unhealthy', 'database_error': str(e)}), 500
+
+
+@app.route('/api/kpi_summary')
+@login_required
+@cache.cached(timeout=cache_timeout)
+def kpi_summary():
+    """Provides a summary of key performance indicators for the main dashboard."""
+    query = text("""
+        SELECT
+            (SELECT COUNT(*) FROM customers) AS total_customers,
+            (SELECT COUNT(*) FROM cdr_events) AS number_of_operations,
+            (SELECT COUNT(DISTINCT cust_num) FROM cdr_events WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 1 YEAR)) AS active_customers,
+            IFNULL(SUM(CASE WHEN operation_type_id IN (1, 2, 3) THEN deduct_amount ELSE 0 END), 0) AS total_revenue,
+            IFNULL(SUM(charge_amount), 0) AS total_charges
+        FROM cdr_events LIMIT 1
+    """)  # LIMIT 1 is a trick to make it return a single row, even if cdr_events is empty
+    df = query_to_dataframe(query)
+
+    # Ensure df is not empty before accessing data
+    if df.empty or df.iloc[0].isnull().all():
+        # Return default zero values if no data or all nulls
+        summary = {
+            'total_revenue': 0.0,
+            'total_charges': 0.0,
+            'total_deducted': 0.0,
+            'number_of_operations': 0,
+            'active_customers': 0,
+            'arpu': 0.0
+        }
+        return jsonify(summary)
+
+    stats = df.iloc[0]
+    total_customers = int(stats['total_customers']) if pd.notna(stats['total_customers']) else 0
+    total_revenue = float(stats['total_revenue']) if pd.notna(stats['total_revenue']) else 0.0
+    arpu = total_revenue / total_customers if total_customers > 0 else 0.0
+
+    summary = {
+        'total_revenue': total_revenue,
+        'total_charges': float(stats['total_charges']) if pd.notna(stats['total_charges']) else 0.0,
+        'total_deducted': total_revenue,  # Assuming deduct_amount IS revenue
+        'number_of_operations': int(stats['number_of_operations']) if pd.notna(stats['number_of_operations']) else 0,
+        'active_customers': int(stats['active_customers']) if pd.notna(stats['active_customers']) else 0,
+        'arpu': arpu
+    }
+    return jsonify(summary)
 
 
 @app.route('/api/overall_stats')
@@ -909,14 +885,14 @@ def overall_stats():
     total_customers_query = "SELECT COUNT(*) as total_customers FROM customers"
     df_total_customers = query_to_dataframe(total_customers_query)
     total_customers = 0
-    if not df_total_customers.empty:
+    if not df_total_customers.empty and pd.notna(df_total_customers['total_customers'].iloc[0]):
         total_customers = int(df_total_customers['total_customers'].iloc[0])
     stats['total_customers'] = total_customers
 
     total_cdr_events_query = "SELECT COUNT(*) as total_events FROM cdr_events"
     df_total_events = query_to_dataframe(total_cdr_events_query)
     total_cdr_events = 0
-    if not df_total_events.empty:
+    if not df_total_events.empty and pd.notna(df_total_events['total_events'].iloc[0]):
         total_cdr_events = int(df_total_events['total_events'].iloc[0])
     stats['total_cdr_events'] = total_cdr_events
 
@@ -927,14 +903,14 @@ def overall_stats():
     """
     df_total_revenue = query_to_dataframe(total_revenue_query)
     total_revenue = 0.0
-    if not df_total_revenue.empty:
+    if not df_total_revenue.empty and pd.notna(df_total_revenue['total_revenue'].iloc[0]):
         total_revenue = float(df_total_revenue['total_revenue'].iloc[0])
     stats['total_revenue'] = total_revenue
 
     total_charges_query = "SELECT IFNULL(SUM(charge_amount), 0) as total_charges FROM cdr_events"
     df_total_charges = query_to_dataframe(total_charges_query)
     total_charges = 0.0
-    if not df_total_charges.empty:
+    if not df_total_charges.empty and pd.notna(df_total_charges['total_charges'].iloc[0]):
         total_charges = float(df_total_charges['total_charges'].iloc[0])
     stats['total_charges'] = total_charges
 
@@ -945,7 +921,7 @@ def overall_stats():
     """
     df_active_customers_year = query_to_dataframe(active_customers_year_query)
     active_customers_year = 0
-    if not df_active_customers_year.empty:
+    if not df_active_customers_year.empty and pd.notna(df_active_customers_year['active_customers_year'].iloc[0]):
         active_customers_year = int(df_active_customers_year['active_customers_year'].iloc[0])
     stats['active_customers_year'] = active_customers_year
 
@@ -953,7 +929,7 @@ def overall_stats():
     total_offers_query = "SELECT COUNT(*) as total_offers FROM offers"
     df_total_offers = query_to_dataframe(total_offers_query)
     total_offers = 0
-    if not df_total_offers.empty:
+    if not df_total_offers.empty and pd.notna(df_total_offers['total_offers'].iloc[0]):
         total_offers = int(df_total_offers['total_offers'].iloc[0])
     stats['total_offers'] = total_offers
 
@@ -969,7 +945,7 @@ def overall_stats():
     unique_active_offers_query = "SELECT COUNT(DISTINCT offer_id) as unique_active_offers FROM cdr_events WHERE offer_id IS NOT NULL"
     df_unique_active_offers = query_to_dataframe(unique_active_offers_query)
     unique_active_offers = 0
-    if not df_unique_active_offers.empty:
+    if not df_unique_active_offers.empty and pd.notna(df_unique_active_offers['unique_active_offers'].iloc[0]):
         unique_active_offers = int(df_unique_active_offers['unique_active_offers'].iloc[0])
     stats['unique_active_offers'] = unique_active_offers
 
@@ -977,7 +953,7 @@ def overall_stats():
     unique_operation_types_query = "SELECT COUNT(DISTINCT operation_type_id) as unique_operation_types FROM cdr_events WHERE operation_type_id IS NOT NULL"
     df_unique_operation_types = query_to_dataframe(unique_operation_types_query)
     unique_operation_types = 0
-    if not df_unique_operation_types.empty:
+    if not df_unique_operation_types.empty and pd.notna(df_unique_operation_types['unique_operation_types'].iloc[0]):
         unique_operation_types = int(df_unique_operation_types['unique_operation_types'].iloc[0])
     stats['unique_operation_types'] = unique_operation_types
 
@@ -989,7 +965,7 @@ def overall_stats():
     """
     df_unique_object_types = query_to_dataframe(unique_object_types_query)
     unique_object_types_used = 0
-    if not df_unique_object_types.empty:
+    if not df_unique_object_types.empty and pd.notna(df_unique_object_types['unique_object_types_used'].iloc[0]):
         unique_object_types_used = int(df_unique_object_types['unique_object_types_used'].iloc[0])
     stats['unique_object_types_used'] = unique_object_types_used
 
@@ -1086,9 +1062,7 @@ def overall_stats():
     })
 
 
-""" --- 2. CUSTOMER BEHAVIOR AND SEGMENTATION ANALYSIS --- """
-
-
+# --- API Group: Customer Behavior & Segmentation ---
 @app.route('/api/customer_type_distribution')
 @login_required
 @cache.cached(timeout=cache_timeout)
@@ -1101,8 +1075,8 @@ def customer_type_distribution():
     query = """
     SELECT 
         cust_type,
-        COUNT(*) as customer_count,
-        COUNT(DISTINCT o.object_id_bigint) as object_count
+        COUNT(DISTINCT c.cust_num_bigint) as customer_count,
+        COUNT(o.object_id_bigint) as object_count
     FROM customers c
     LEFT JOIN objects o ON c.cust_num_bigint = o.cust_num_bigint
     GROUP BY cust_type
@@ -1134,9 +1108,7 @@ def customer_spending_segments():
     """
     Segment customers into High/Medium/Low value based on total spending (DEDUCT_AMOUNT).
     Uses percentiles to create meaningful segments.
-    NOTE: This function requires MySQL 8.0+ for PERCENTILE_CONT.
     """
-    # Modified query to use ROW_NUMBER() and approximate percentiles for MySQL 5.7 compatibility
     query = """
     WITH customer_spending AS (
         SELECT 
@@ -1222,14 +1194,14 @@ def customer_behavior_by_type():
     SELECT 
         c.cust_type,
         COUNT(DISTINCT ce.cust_num) as active_customers,
-        AVG(ce.deduct_amount) as avg_deduct_amount,
-        AVG(ce.charge_amount) as avg_charge_amount,
-        SUM(ce.deduct_amount) as total_revenue,
+        IFNULL(AVG(ce.deduct_amount), 0) as avg_deduct_amount,
+        IFNULL(AVG(ce.charge_amount), 0) as avg_charge_amount,
+        IFNULL(SUM(ce.deduct_amount), 0) as total_revenue,
         COUNT(ce.cdr_event_id) as total_events,
-        COUNT(ce.cdr_event_id) / COUNT(DISTINCT ce.cust_num) as avg_events_per_customer,
-        AVG(ce.current_amount_post) as avg_balance_after_transaction
+        (COUNT(ce.cdr_event_id) / COUNT(DISTINCT ce.cust_num)) as avg_events_per_customer,
+        IFNULL(AVG(ce.current_amount_post), 0) as avg_balance_after_transaction
     FROM customers c
-    JOIN cdr_events ce ON c.cust_num_bigint = ce.cust_num # Corrected JOIN condition
+    JOIN cdr_events ce ON c.cust_num_bigint = ce.cust_num
     GROUP BY c.cust_type
     """
     df = query_to_dataframe(query)
@@ -1240,7 +1212,8 @@ def customer_behavior_by_type():
     else:
         fig = make_subplots(
             rows=2, cols=2,
-            subplot_titles=('Revenue Comparison', 'Usage Frequency', 'Average Transaction', 'Customer Count'),
+            subplot_titles=('Total Revenue Comparison', 'Usage Frequency (Events/Customer)', 'Average Deduct Amount',
+                            'Active Customer Count'),
             specs=[[{"secondary_y": False}, {"secondary_y": False}],
                    [{"secondary_y": False}, {"secondary_y": False}]]
         )
@@ -1280,7 +1253,6 @@ def customer_offer_preferences():
     """
     Segment customers based on their most frequently used offers.
     Creates segments like 'Data-heavy users', 'Voice-centric users', 'Loan takers'.
-    NOTE: This function requires MySQL 8.0+ for ROW_NUMBER().
     """
     query = """
     WITH customer_offer_usage AS (
@@ -1309,7 +1281,7 @@ def customer_offer_preferences():
     )
     SELECT 
         user_segment,
-        COUNT(*) as customer_count,
+        COUNT(DISTINCT cpp.cust_num) as customer_count,
         AVG(total_revenue.total_spent) as avg_customer_value
     FROM customer_primary_preference cpp
     JOIN (
@@ -1399,7 +1371,6 @@ def customer_journey_analysis():
     """
     Track customer journey from first transaction to current state.
     Shows progression through different offers and spending patterns.
-    NOTE: This function requires MySQL 8.0+ for ROW_NUMBER().
     """
     query = """
     WITH customer_journey AS (
@@ -1452,7 +1423,6 @@ def customer_journey_analysis():
         fig = go.Figure()
         fig.update_layout(title_text="No customer journey data available.")
     else:
-        # Fix: Create a go.Figure and add the funnel trace to it
         fig = go.Figure(go.Funnel(
             y=df['journey_stage'],
             x=df['customers_count'],
@@ -1472,9 +1442,7 @@ def customer_journey_analysis():
     })
 
 
-""" --- 3. OFFER PERFORMANCE AND PRODUCT ANALYSIS --- """
-
-
+# --- API Group: Offer & Product Analysis ---
 @app.route('/api/offers_summary')
 @login_required
 @cache.cached(timeout=cache_timeout)
@@ -1484,7 +1452,7 @@ def offers_summary():
     Calculates subscriber count, event count, average, and total deduction amounts per offer.
     Generates a bar chart showing the number of subscribers by offer.
     """
-    query = """
+    query = text("""
     SELECT 
         o.offer_id, 
         o.offer_name,
@@ -1493,10 +1461,10 @@ def offers_summary():
         IFNULL(AVG(ce.deduct_amount), 0) as avg_deduct_amount,
         IFNULL(SUM(ce.deduct_amount), 0) as total_deduct_amount
     FROM offers o
-    LEFT JOIN cdr_events ce ON o.offer_id = ce.offer_id # Corrected JOIN condition
+    LEFT JOIN cdr_events ce ON o.offer_id = ce.offer_id
     GROUP BY o.offer_id, o.offer_name
     ORDER BY subscriber_count DESC
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['subscriber_count'].sum() == 0:
@@ -1528,9 +1496,8 @@ def offer_performance():
     and average offer lifetime in days for each offer.
     Generates a scatter plot to visualize offer performance, with marker size
     representing event count.
-    NOTE: This function requires MySQL 8.0+ for the subquery in DATEDIFF.
     """
-    query = """
+    query = text("""
     SELECT 
         o.offer_id,
         o.offer_name,
@@ -1544,7 +1511,7 @@ def offer_performance():
     LEFT JOIN cdr_events ce ON o.offer_id = ce.offer_id 
     GROUP BY o.offer_id, o.offer_name
     ORDER BY subscriber_count DESC
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or (
@@ -1560,7 +1527,7 @@ def offer_performance():
                 df,
                 x='subscriber_count',
                 y='total_usage',
-                size=df['event_count'].apply(lambda x: max(x, 1)),
+                size=df['event_count'].apply(lambda x: max(x, 1)),  # Ensure size is at least 1 for visibility
                 hover_name='offer_name',
                 title='Offer Performance Analysis',
                 labels={
@@ -1569,7 +1536,7 @@ def offer_performance():
                     'event_count': 'Number of Events'
                 }
             )
-            if len(df) < 20:
+            if len(df) < 20:  # Only add text labels if there aren't too many points
                 fig.update_traces(text=df['offer_name'], textposition='top center')
 
     return jsonify({
@@ -1586,7 +1553,7 @@ def offer_trend_analysis():
     Track the trend of offer subscriptions over time (CREATION_TIME).
     Shows which offers are growing or declining in popularity.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE_FORMAT(ce.creation_time, '%Y-%m') as month,
         o.offer_name,
@@ -1598,13 +1565,14 @@ def offer_trend_analysis():
     WHERE ce.creation_time >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
     GROUP BY month, o.offer_name
     ORDER BY month, o.offer_name
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
         fig = go.Figure()
         fig.update_layout(title_text="No offer trend data available.")
     else:
+        # Filter for top N offers to keep the chart readable
         top_offers = df.groupby('offer_name')['unique_subscribers'].sum().nlargest(10).index
         df_filtered = df[df['offer_name'].isin(top_offers)]
 
@@ -1639,7 +1607,7 @@ def data_bundle_analysis():
     Calculates subscriber count, average usage (deduct_amount), and average duration in hours.
     Generates a bar chart for data bundle popularity and usage.
     """
-    query = """
+    query = text("""
     SELECT 
         o.offer_id,
         o.offer_name,
@@ -1647,10 +1615,11 @@ def data_bundle_analysis():
         IFNULL(AVG(ce.deduct_amount), 0) as avg_usage,
         IFNULL(AVG(TIMESTAMPDIFF(HOUR, ce.creation_time, ce.charge_expire_time)), 0) as avg_duration_hours
     FROM offers o
-    LEFT JOIN cdr_events ce ON o.offer_id = ce.offer_id # Corrected JOIN condition
+    LEFT JOIN cdr_events ce ON o.offer_id = ce.offer_id 
+    WHERE o.offer_name LIKE '%Data%' OR o.offer_name LIKE '%Mo%' OR o.offer_name LIKE '%Internet%'
     GROUP BY o.offer_id, o.offer_name
     ORDER BY subscriber_count DESC
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['subscriber_count'].sum() == 0:
@@ -1661,7 +1630,7 @@ def data_bundle_analysis():
             df,
             x='offer_name',
             y='subscriber_count',
-            color='avg_usage',
+            color='avg_usage',  # Color by average usage to show usage intensity
             title='Data Bundle Popularity and Usage',
             labels={
                 'offer_name': 'Data Bundle',
@@ -1684,9 +1653,8 @@ def cross_offer_analysis():
     """
     Analyze customers who subscribe to multiple offers.
     Shows cross-selling opportunities and customer behavior patterns.
-    NOTE: This function requires MySQL 8.0+ for GROUP_CONCAT.
     """
-    query = """
+    query = text("""
     WITH customer_offers AS (
         SELECT 
             ce.cust_num,
@@ -1708,7 +1676,7 @@ def cross_offer_analysis():
     FROM customer_offers
     GROUP BY unique_offers_used
     ORDER BY unique_offers_used
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -1738,28 +1706,26 @@ def cross_offer_analysis():
     })
 
 
-""" --- 4. FINANCIAL AND REVENUE ANALYSIS --- """
-
-
+# --- API Group: Financial & Revenue Analysis ---
 @app.route('/api/revenue_analysis')
-@login_required  # Added login_required decorator
-@cache.cached(timeout=cache_timeout)  # Added caching
+@login_required
+@cache.cached(timeout=cache_timeout)
 def revenue_analysis():
     """
     API endpoint for revenue analysis.
     Calculates monthly revenue broken down by offer, focusing on usage operation types.
     Generates a stacked bar chart for monthly revenue by offer.
     """
-    query = """
+    query = text("""
     SELECT DATE_FORMAT(ce.creation_time, '%Y-%m') as month,
            o.offer_name,
            IFNULL(SUM(ce.deduct_amount), 0) as revenue
     FROM cdr_events ce
     LEFT JOIN offers o ON ce.offer_id = o.offer_id
-    WHERE ce.operation_type_id IN (1, 2, 3)
+    WHERE ce.operation_type_id IN (1, 2, 3) # Assuming 1,2,3 are usage-related operation types
     GROUP BY month, o.offer_name
     ORDER BY month, o.offer_name
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['revenue'].sum() == 0:
@@ -1775,16 +1741,9 @@ def revenue_analysis():
             labels={'month': 'Month', 'revenue': 'Revenue', 'offer_name': 'Offer Name'}
         )
 
-    chart_data = create_figure_json(fig)
-    if not chart_data:
-        # This check is technically redundant if create_figure_json always returns a string
-        # but kept for defensive programming if it were to fail silently.
-        # However, a more appropriate error would be raised by json.dumps.
-        return jsonify({'error': 'Chart data serialization failed'}), 500
-
     return jsonify({
         'data': df.to_dict('records'),
-        'chart': chart_data
+        'chart': create_figure_json(fig)
     })
 
 
@@ -1796,7 +1755,7 @@ def revenue_trends_by_customer_type():
     Track revenue trends over time broken down by customer type (CUST_TYPE).
     Shows growth patterns for different customer segments.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE_FORMAT(ce.creation_time, '%Y-%m') as month,
         c.cust_type,
@@ -1809,7 +1768,7 @@ def revenue_trends_by_customer_type():
     WHERE ce.creation_time >= DATE_SUB(NOW(), INTERVAL 18 MONTH)
     GROUP BY month, c.cust_type
     ORDER BY month, c.cust_type
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -1844,7 +1803,7 @@ def arpu_analysis():
     Calculate Average Revenue Per User (ARPU) by customer type and time period.
     Essential metric for telecom business analysis.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE_FORMAT(ce.creation_time, '%Y-%m') as month,
         c.cust_type,
@@ -1857,7 +1816,7 @@ def arpu_analysis():
     WHERE ce.creation_time >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
     GROUP BY month, c.cust_type
     ORDER BY month, c.cust_type
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -1892,7 +1851,7 @@ def balance_flow_analysis():
     Analyze the flow of funds: CHARGE_AMOUNT vs DEDUCT_AMOUNT over time.
     Shows money in vs money out patterns.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE_FORMAT(creation_time, '%Y-%m') as month,
         SUM(IFNULL(charge_amount, 0)) as total_charged,
@@ -1904,7 +1863,7 @@ def balance_flow_analysis():
     WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
     GROUP BY month
     ORDER BY month
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -1944,9 +1903,8 @@ def balance_flow_analysis():
 def loan_analysis():
     """
     Analyze loan offers performance, repayment patterns, and risk assessment.
-    NOTE: This function requires MySQL 8.0+ for CTEs.
     """
-    query = """
+    query = text("""
     WITH loan_events AS (
         SELECT 
             ce.cust_num,
@@ -1990,7 +1948,7 @@ def loan_analysis():
     FROM loan_customers
     WHERE total_loans_taken > 0
     GROUP BY cust_type
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2038,9 +1996,7 @@ def loan_analysis():
     })
 
 
-""" --- 5. OPERATIONAL AND RESOURCE MANAGEMENT --- """
-
-
+# --- API Group: Operational & Resource Management ---
 @app.route('/api/operations_breakdown')
 @login_required
 @cache.cached(timeout=cache_timeout)
@@ -2051,7 +2007,7 @@ def operations_breakdown():
     for each operation type.
     Generates a bar chart showing events by operation type.
     """
-    query = """
+    query = text("""
     SELECT 
         ot.operation_type_id,
         ot.description,
@@ -2060,10 +2016,10 @@ def operations_breakdown():
         IFNULL(AVG(ce.deduct_amount), 0) as avg_deduct_amount,
         IFNULL(SUM(ce.deduct_amount), 0) as total_deduct_amount
     FROM operation_types ot
-    LEFT JOIN cdr_events ce ON ot.operation_type_id = ce.operation_type_id # Corrected JOIN condition
+    LEFT JOIN cdr_events ce ON ot.operation_type_id = ce.operation_type_id
     GROUP BY ot.operation_type_id, ot.description
     ORDER BY event_count DESC
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['event_count'].sum() == 0:
@@ -2094,17 +2050,17 @@ def object_types_analysis():
     Calculates the count of objects and customers for each object type.
     Generates a pie chart to visualize the distribution.
     """
-    query = """
+    query = text("""
     SELECT 
         ot.object_type_code,
         ot.description,
         COUNT(DISTINCT o.object_id_bigint) as object_count,
         COUNT(DISTINCT o.cust_num_bigint) as customer_count
     FROM object_types ot
-    LEFT JOIN objects o ON ot.object_type_id = o.object_type_id # Corrected JOIN condition
+    LEFT JOIN objects o ON ot.object_type_id = o.object_type_id
     GROUP BY ot.object_type_code, ot.description
-    ORDER BY object_count DESC # Added ORDER BY for consistent results
-    """
+    ORDER BY object_count DESC
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['object_count'].sum() == 0:
@@ -2134,7 +2090,7 @@ def time_series_analysis():
     Aggregates daily event counts, total deduction amounts, and active customers
     over the last 5 years.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE(creation_time) as event_date,
         COUNT(*) as event_count,
@@ -2144,7 +2100,7 @@ def time_series_analysis():
     WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 5 YEAR) 
     GROUP BY DATE(creation_time)
     ORDER BY event_date
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2181,7 +2137,7 @@ def usage_patterns_by_time():
     Analyze peak usage times using CREATION_TIME.
     Shows hourly and daily patterns for better resource planning.
     """
-    query = """
+    query = text("""
     SELECT 
         HOUR(creation_time) as hour_of_day,
         DAYNAME(creation_time) as day_of_week,
@@ -2194,7 +2150,7 @@ def usage_patterns_by_time():
     WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
     GROUP BY hour_of_day, day_of_week, day_num
     ORDER BY day_num, hour_of_day
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2239,7 +2195,7 @@ def expiry_forecast():
     Aggregates expiring objects and affected customers by expiry date and object type
     for objects expiring within the next year.
     """
-    query = """
+    query = text("""
     SELECT 
         DATE(o.expiry_date) as expiry_date,
         ot.description as object_type,
@@ -2250,7 +2206,7 @@ def expiry_forecast():
     WHERE o.expiry_date IS NOT NULL AND o.expiry_date <= DATE_ADD(NOW(), INTERVAL 1 YEAR) 
     GROUP BY expiry_date, object_type
     ORDER BY expiry_date, object_type
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['expiring_objects'].sum() == 0:
@@ -2285,7 +2241,7 @@ def expiry_impact_analysis():
     Analyze the impact of CHARGE_AMOUNT_EXPIRE_TIME and CURRENT_AMOUNT_EXPIRE_TIME
     on customer behavior and potential revenue loss.
     """
-    query = """
+    query = text("""
     WITH expiry_analysis AS (
         SELECT 
             ce.cust_num,
@@ -2312,7 +2268,7 @@ def expiry_impact_analysis():
         AVG(expired_charged_amount / NULLIF(total_charged, 0)) as expiry_rate
     FROM expiry_analysis
     GROUP BY expiry_status
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2321,7 +2277,7 @@ def expiry_impact_analysis():
     else:
         fig = make_subplots(
             rows=1, cols=2,
-            subplot_titles=('Customer Distribution', 'Expired Value Impact'),
+            subplot_titles=('Customer Distribution by Expiry Status', 'Total Expired Value Impact'),
             specs=[[{"type": "pie"}, {"type": "bar"}]]
         )
 
@@ -2349,9 +2305,8 @@ def expiry_impact_analysis():
 def network_capacity_analysis():
     """
     Analyze network usage patterns to identify peak capacity needs.
-    NOTE: This function requires MySQL 8.0+ for CTEs.
     """
-    query = """
+    query = text("""
     WITH hourly_usage AS (
         SELECT 
             DATE(creation_time) as usage_date,
@@ -2361,8 +2316,8 @@ def network_capacity_analysis():
             SUM(CASE WHEN o.offer_name LIKE '%Data%' OR o.offer_name LIKE '%Internet%' THEN 1 ELSE 0 END) as data_events,
             SUM(CASE WHEN o.offer_name LIKE '%Voice%' OR o.offer_name LIKE '%min%' THEN 1 ELSE 0 END) as voice_events
         FROM cdr_events ce
-        JOIN offers o ON ce.offer_id = o.offer_id
-        WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+        LEFT JOIN offers o ON ce.offer_id = o.offer_id -- Use LEFT JOIN to include events without offers
+        WHERE ce.creation_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)
         GROUP BY usage_date, usage_hour
     ),
     capacity_metrics AS (
@@ -2392,7 +2347,7 @@ def network_capacity_analysis():
         END as capacity_status
     FROM capacity_metrics
     ORDER BY usage_hour
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2442,9 +2397,11 @@ def data_quality_report():
         'offer_consistency': """
             SELECT 
                 'Offer ID Consistency' as check_type,
-                COUNT(*) as total_records,
-                COUNT(CASE WHEN ce.offer_id != o.offer_id THEN 1 END) as inconsistent_records,
-                (COUNT(CASE WHEN ce.offer_id != o.offer_id THEN 1 END) / COUNT(*)) * 100 as inconsistency_rate
+                COUNT(ce.cdr_event_id) as total_records,
+                COUNT(CASE WHEN ce.offer_id IS NOT NULL AND o.offer_id IS NULL THEN 1 END) as inconsistent_records_no_match,
+                COUNT(CASE WHEN ce.offer_id IS NOT NULL AND o.offer_id IS NOT NULL AND ce.offer_id != o.offer_id THEN 1 END) as inconsistent_records_mismatch,
+                (COUNT(CASE WHEN ce.offer_id IS NOT NULL AND o.offer_id IS NULL THEN 1 END) + 
+                 COUNT(CASE WHEN ce.offer_id IS NOT NULL AND o.offer_id IS NOT NULL AND ce.offer_id != o.offer_id THEN 1 END)) / COUNT(ce.cdr_event_id) * 100 as inconsistency_rate
             FROM cdr_events ce
             LEFT JOIN offers o ON ce.offer_id = o.offer_id
         """,
@@ -2455,7 +2412,7 @@ def data_quality_report():
                 COUNT(*) as total_records,
                 COUNT(CASE WHEN deduct_amount < 0 THEN 1 END) as negative_deductions,
                 COUNT(CASE WHEN charge_amount < 0 THEN 1 END) as negative_charges,
-                COUNT(CASE WHEN deduct_amount > 1000 THEN 1 END) as high_deductions,
+                COUNT(CASE WHEN deduct_amount > (SELECT AVG(deduct_amount) * 10 FROM cdr_events) THEN 1 END) as high_deductions,
                 AVG(deduct_amount) as avg_deduct,
                 STDDEV(deduct_amount) as stddev_deduct
             FROM cdr_events
@@ -2487,18 +2444,34 @@ def data_quality_report():
         df = query_to_dataframe(query)
         # Ensure consistent structure for results, even if a query returns empty
         if not df.empty:
-            # Convert DataFrame row to dictionary, ensuring 'total_records' is present
             row_dict = df.iloc[0].to_dict()
-            if 'total_records' not in row_dict:
-                row_dict['total_records'] = 0  # Default if not present
+            # Fill missing keys with default values if they are not in the query result
+            for key in ['total_records', 'inconsistent_records_no_match', 'inconsistent_records_mismatch',
+                        'negative_deductions', 'negative_charges', 'high_deductions', 'avg_deduct', 'stddev_deduct',
+                        'future_timestamps', 'very_old_timestamps', 'invalid_expiry_times',
+                        'customers_in_events', 'customers_in_master', 'orphaned_customers', 'inconsistency_rate']:
+                row_dict.setdefault(key, 0 if key not in ['avg_deduct', 'stddev_deduct'] else None)
             results.append(row_dict)
         else:
             # Append a default structure for empty results to keep table consistent
-            results.append(
-                {'check_type': check_name.replace('_', ' ').title(), 'total_records': 0, 'inconsistent_records': 0,
-                 'negative_deductions': 0, 'negative_charges': 0, 'high_deductions': 0, 'future_timestamps': 0,
-                 'very_old_timestamps': 0, 'invalid_expiry_times': 0, 'customers_in_events': 0,
-                 'customers_in_master': 0, 'orphaned_customers': 0})
+            results.append({
+                'check_type': check_name.replace('_', ' ').title(),
+                'total_records': 0,
+                'inconsistent_records_no_match': 0,
+                'inconsistent_records_mismatch': 0,
+                'inconsistency_rate': 0.0,
+                'negative_deductions': 0,
+                'negative_charges': 0,
+                'high_deductions': 0,
+                'avg_deduct': None,
+                'stddev_deduct': None,
+                'future_timestamps': 0,
+                'very_old_timestamps': 0,
+                'invalid_expiry_times': 0,
+                'customers_in_events': 0,
+                'customers_in_master': 0,
+                'orphaned_customers': 0
+            })
 
     if not results:
         fig = go.Figure()
@@ -2507,7 +2480,9 @@ def data_quality_report():
         # Ensure all dictionaries in results have the same keys for table rendering
         all_keys = sorted(list(set(k for d in results for k in d.keys())))
         table_header_values = [k.replace('_', ' ').title() for k in all_keys]
-        table_cell_values = [[row.get(k, 'N/A') for k in all_keys] for row in results]  # Use .get with default 'N/A'
+        # Use .get with default 'N/A' for cell values, converting floats to formatted strings
+        table_cell_values = [[(f"{row.get(k, 'N/A'):.2f}" if isinstance(row.get(k), (float)) and k not in [
+            'inconsistency_rate'] else row.get(k, 'N/A')) for k in all_keys] for row in results]
 
         fig = go.Figure(data=[
             go.Table(
@@ -2526,9 +2501,7 @@ def data_quality_report():
     })
 
 
-""" --- 6. PREDICTIVE ANALYSIS AND RECOMMENDATION --- """
-
-
+# --- API Group: Predictive Analysis & Recommendation ---
 @app.route('/api/churn_analysis')
 @login_required
 @cache.cached(timeout=cache_timeout)
@@ -2537,9 +2510,8 @@ def churn_analysis():
     API endpoint for churn analysis.
     Identifies churned customers (inactive for > 90 days) and aggregates
     churn count by quarter. Also provides a breakdown of churned customers by offer.
-    NOTE: This function requires MySQL 8.0+ for CTEs.
     """
-    query = """
+    query = text("""
     WITH customer_activity AS (
         SELECT 
             c.cust_num_bigint as cust_num,
@@ -2564,7 +2536,7 @@ def churn_analysis():
     FROM churned
     GROUP BY churn_year, churn_quarter
     ORDER BY churn_year, churn_quarter
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty or df['churn_count'].sum() == 0:
@@ -2579,38 +2551,38 @@ def churn_analysis():
             labels={'period': 'Time Period', 'churn_count': 'Number of Churned Customers'}
         )
 
-    offers_churn_query = """
+    offers_churn_query = text("""
     WITH customer_last_offer AS (
         SELECT 
             ce.cust_num,
             ce.offer_id,
-            MAX(ce.creation_time) as last_activity_date,
-            DATEDIFF(NOW(), MAX(ce.creation_time)) as days_since_last_activity
+            MAX(ce.creation_time) as last_activity_date
         FROM cdr_events ce
         GROUP BY ce.cust_num, ce.offer_id
     ),
-    churned AS (
+    churned_cust_offer AS ( -- Renamed to avoid conflict
         SELECT 
             clo.cust_num,
             clo.offer_id
         FROM customer_last_offer clo
-        WHERE clo.days_since_last_activity > 90
+        WHERE DATEDIFF(NOW(), clo.last_activity_date) > 90
     )
     SELECT 
         o.offer_id,
         o.offer_name,
         COUNT(DISTINCT ch.cust_num) as churned_customers
-    FROM churned ch
+    FROM churned_cust_offer ch -- Using the renamed CTE
     JOIN offers o ON ch.offer_id = o.offer_id
     GROUP BY o.offer_id, o.offer_name
     ORDER BY churned_customers DESC
-    """
+    """)
     offers_churn_df = query_to_dataframe(offers_churn_query)
 
     return jsonify({
-        'data': offers_churn_df.to_dict('records'),  # Corrected to return offers_churn_df for 'data'
-        'chart': create_figure_json(fig),
+        'data': offers_churn_df.to_dict('records'),  # Data for the table
+        'chart': create_figure_json(fig),  # Chart for churn over time
         'offers_churn': offers_churn_df.to_dict('records')
+        # Separate data for offers churn breakdown (can be table/list on frontend)
     })
 
 
@@ -2620,9 +2592,8 @@ def churn_analysis():
 def churn_risk_analysis():
     """
     Identify customers at risk of churning based on usage patterns and activity.
-    NOTE: This function requires MySQL 8.0+ for CTEs.
     """
-    query = """
+    query = text("""
     WITH customer_activity AS (
         SELECT 
             ce.cust_num,
@@ -2665,12 +2636,12 @@ def churn_risk_analysis():
     ORDER BY 
         CASE churn_risk_level 
             WHEN 'High Risk' THEN 1 
-            WHEN 'Medium Value' THEN 2 
+            WHEN 'Medium Risk' THEN 2 
             WHEN 'Low Engagement' THEN 3
             ELSE 4 
         END,
         cust_type
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2703,9 +2674,8 @@ def churn_risk_analysis():
 def seasonal_usage_prediction():
     """
     Analyze seasonal patterns and predict future usage based on historical data.
-    NOTE: This function requires MySQL 8.0+ for CTEs.
     """
-    query = """
+    query = text("""
     WITH monthly_usage AS (
         SELECT 
             YEAR(creation_time) as year,
@@ -2746,7 +2716,7 @@ def seasonal_usage_prediction():
         data_points
     FROM seasonal_patterns
     ORDER BY month
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2784,11 +2754,8 @@ def next_offer_recommendation():
     """
     Recommend next offers based on customer's current usage and offer history.
     Uses collaborative filtering approach.
-    NOTE: This function requires MySQL 8.0+ for CTEs and ROW_NUMBER().
     """
-    # Removed preferred_offer from query, as it's not available without complex subquery
-    # and not present in customer_segments CTE. Replaced with simpler filtering.
-    query = """
+    query = text("""
     WITH customer_offer_matrix AS (
         SELECT
             ce.cust_num,
@@ -2847,7 +2814,7 @@ def next_offer_recommendation():
     FROM recommendations
     WHERE recommendation_rank_calc <= 3
     ORDER BY user_segment, recommendation_rank
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -2874,9 +2841,7 @@ def next_offer_recommendation():
     })
 
 
-""" --- 7. DETAILED ENTITY LOOKUPS --- """
-
-
+# --- API Group: Detailed Entity Lookups ---
 @app.route('/api/customer_details/<int:cust_num>')
 @login_required
 @cache.cached(timeout=cache_timeout)
@@ -2886,26 +2851,26 @@ def customer_details(cust_num):
     Fetches customer's basic info, associated objects/balances, and recent CDR events.
     This is a lookup endpoint, returning raw data, not a chart.
     """
-    customer_query = """
-    SELECT cust_num_bigint, cust_type FROM customers WHERE cust_num_bigint = %s
-    """
-    customer_df = query_to_dataframe(customer_query, params=(cust_num,))
+    customer_query = text("""
+    SELECT cust_num_bigint, cust_type FROM customers WHERE cust_num_bigint = :cust_num
+    """)
+    customer_df = query_to_dataframe(customer_query, params={'cust_num': cust_num})
     if customer_df.empty:
         return jsonify({'error': 'Customer not found'}), 404
 
-    objects_query = """
+    objects_query = text("""
     SELECT 
         o.object_id_bigint, 
         ot.description as object_type_description, 
         o.expiry_date
     FROM objects o
     JOIN object_types ot ON o.object_type_id = ot.object_type_id
-    WHERE o.cust_num_bigint = %s
+    WHERE o.cust_num_bigint = :cust_num
     ORDER BY o.expiry_date DESC
-    """
-    objects_df = query_to_dataframe(objects_query, params=(cust_num,))
+    """)
+    objects_df = query_to_dataframe(objects_query, params={'cust_num': cust_num})
 
-    cdr_events_query = """
+    cdr_events_query = text("""
     SELECT 
         ce.cdr_event_id, 
         ce.creation_time, 
@@ -2918,11 +2883,11 @@ def customer_details(cust_num):
     FROM cdr_events ce
     JOIN operation_types op ON ce.operation_type_id = op.operation_type_id
     LEFT JOIN offers of ON ce.offer_id = of.offer_id
-    WHERE ce.cust_num = %s
+    WHERE ce.cust_num = :cust_num
     ORDER BY ce.creation_time DESC
     LIMIT 100
-    """
-    cdr_events_df = query_to_dataframe(cdr_events_query, params=(cust_num,))
+    """)
+    cdr_events_df = query_to_dataframe(cdr_events_query, params={'cust_num': cust_num})
 
     return jsonify({
         'customer_info': customer_df.iloc[0].to_dict(),
@@ -2940,7 +2905,7 @@ def object_details(object_id):
     Fetches object's basic info and related CDR events.
     This is a lookup endpoint, returning raw data, not a chart.
     """
-    object_query = """
+    object_query = text("""
     SELECT 
         o.object_id_bigint, 
         o.cust_num_bigint, 
@@ -2948,13 +2913,13 @@ def object_details(object_id):
         o.expiry_date
     FROM objects o
     JOIN object_types ot ON o.object_type_id = ot.object_type_id
-    WHERE o.object_id_bigint = %s
-    """
-    object_df = query_to_dataframe(object_query, params=(object_id,))
+    WHERE o.object_id_bigint = :object_id
+    """)
+    object_df = query_to_dataframe(object_query, params={'object_id': object_id})
     if object_df.empty:
         return jsonify({'error': 'Object not found'}), 404
 
-    cdr_events_query = """
+    cdr_events_query = text("""
     SELECT 
         ce.cdr_event_id, 
         ce.creation_time, 
@@ -2967,11 +2932,11 @@ def object_details(object_id):
     FROM cdr_events ce
     JOIN operation_types op ON ce.operation_type_id = op.operation_type_id
     LEFT JOIN offers of ON ce.offer_id = of.offer_id
-    WHERE ce.object_id = %s
+    WHERE ce.object_id = :object_id
     ORDER BY ce.creation_time DESC
     LIMIT 100
-    """
-    cdr_events_df = query_to_dataframe(cdr_events_query, params=(object_id,))
+    """)
+    cdr_events_df = query_to_dataframe(cdr_events_query, params={'object_id': object_id})
 
     return jsonify({
         'object_info': object_df.iloc[0].to_dict(),
@@ -2979,9 +2944,7 @@ def object_details(object_id):
     })
 
 
-""" --- 8. REAL-TIME MONITORING --- """
-
-
+# --- API Group: Real-time Monitoring & System Health ---
 @app.route('/api/realtime_dashboard')
 @login_required
 @cache.cached(timeout=60)  # Shorter cache for real-time data
@@ -2989,13 +2952,13 @@ def realtime_dashboard():
     """
     Real-time dashboard showing current system activity and key metrics.
     """
-    query = """
+    query = text("""
     SELECT 
         'current_hour' as metric_type,
-        COUNT(*) as current_hour_events,
-        COUNT(DISTINCT cust_num) as current_hour_users,
-        SUM(deduct_amount) as current_hour_revenue,
-        AVG(deduct_amount) as avg_transaction_value
+        COUNT(*) as event_count,
+        COUNT(DISTINCT cust_num) as active_users,
+        SUM(IFNULL(deduct_amount, 0)) as total_revenue,
+        AVG(IFNULL(deduct_amount, 0)) as avg_transaction_value
     FROM cdr_events
     WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
 
@@ -3003,10 +2966,10 @@ def realtime_dashboard():
 
     SELECT 
         'today' as metric_type,
-        COUNT(*) as current_hour_events,
-        COUNT(DISTINCT cust_num) as current_hour_users,
-        SUM(deduct_amount) as current_hour_revenue,
-        AVG(deduct_amount) as avg_transaction_value
+        COUNT(*) as event_count,
+        COUNT(DISTINCT cust_num) as active_users,
+        SUM(IFNULL(deduct_amount, 0)) as total_revenue,
+        AVG(IFNULL(deduct_amount, 0)) as avg_transaction_value
     FROM cdr_events
     WHERE DATE(creation_time) = CURDATE()
 
@@ -3014,19 +2977,29 @@ def realtime_dashboard():
 
     SELECT 
         'yesterday' as metric_type,
-        COUNT(*) as current_hour_events,
-        COUNT(DISTINCT cust_num) as current_hour_users,
-        SUM(deduct_amount) as current_hour_revenue,
-        AVG(deduct_amount) as avg_transaction_value
+        COUNT(*) as event_count,
+        COUNT(DISTINCT cust_num) as active_users,
+        SUM(IFNULL(deduct_amount, 0)) as total_revenue,
+        AVG(IFNULL(deduct_amount, 0)) as avg_transaction_value
     FROM cdr_events
     WHERE DATE(creation_time) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
         fig = go.Figure()
         fig.update_layout(title_text="No real-time data available.")
     else:
+        # Re-index df to ensure order for plotting consistency
+        df_metrics = df.set_index('metric_type')
+        # Ensure all expected rows exist, filling with zeros if no data for that period
+        expected_metrics = ['current_hour', 'today', 'yesterday']
+        for metric in expected_metrics:
+            if metric not in df_metrics.index:
+                df_metrics.loc[metric] = [0, 0, 0, 0]  # event_count, active_users, total_revenue, avg_transaction_value
+
+        df_metrics = df_metrics.reindex(expected_metrics)
+
         fig = make_subplots(
             rows=2, cols=2,
             subplot_titles=('Events', 'Users', 'Revenue', 'Avg Transaction'),
@@ -3035,22 +3008,22 @@ def realtime_dashboard():
         )
 
         fig.add_trace(
-            go.Bar(x=df['metric_type'], y=df['current_hour_events'], name='Events'),
+            go.Bar(x=df_metrics.index, y=df_metrics['event_count'], name='Events'),
             row=1, col=1
         )
 
         fig.add_trace(
-            go.Bar(x=df['metric_type'], y=df['current_hour_users'], name='Users'),
+            go.Bar(x=df_metrics.index, y=df_metrics['active_users'], name='Users'),
             row=1, col=2
         )
 
         fig.add_trace(
-            go.Bar(x=df['metric_type'], y=df['current_hour_revenue'], name='Revenue'),
+            go.Bar(x=df_metrics.index, y=df_metrics['total_revenue'], name='Revenue'),
             row=2, col=1
         )
 
         fig.add_trace(
-            go.Bar(x=df['metric_type'], y=df['avg_transaction_value'], name='Avg Transaction'),
+            go.Bar(x=df_metrics.index, y=df_metrics['avg_transaction_value'], name='Avg Transaction'),
             row=2, col=2
         )
 
@@ -3070,7 +3043,7 @@ def system_health_check():
     """
     System health monitoring including data freshness and anomaly detection.
     """
-    query = """
+    query = text("""
     SELECT 
         'data_freshness' as health_metric,
         MAX(creation_time) as latest_record,
@@ -3089,14 +3062,15 @@ def system_health_check():
         COUNT(DISTINCT cust_num) as total_customers
     FROM cdr_events
     WHERE creation_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
-    """
+    """)
     df = query_to_dataframe(query)
 
     health_status = "Healthy"
     if not df.empty:
         freshness_row = df[df['health_metric'] == 'data_freshness']
-        if not freshness_row.empty and freshness_row.iloc[0]['minutes_since_last_record'] > 60:
-            health_status = "Warning - Data not fresh"
+        if not freshness_row.empty and pd.notna(freshness_row.iloc[0]['minutes_since_last_record']) and \
+                freshness_row.iloc[0]['minutes_since_last_record'] > 60:
+            health_status = "Warning - Data not fresh (last record over 60 mins ago)"
 
     return jsonify({
         'data': df.to_dict('records'),
@@ -3111,16 +3085,15 @@ def system_health_check():
 def competitive_analysis():
     """
     Analyze offer performance against market benchmarks and identify competitive gaps.
-    NOTE: This function requires MySQL 8.0+ for CTEs and RANK().
     """
-    query = """
+    query = text("""
     WITH offer_performance AS (
         SELECT 
             o.offer_name,
             COUNT(DISTINCT ce.cust_num) as unique_users,
-            COUNT(*) as total_usage,
-            SUM(ce.deduct_amount) as total_revenue,
-            AVG(ce.deduct_amount) as avg_revenue_per_use,
+            COUNT(*) as total_usage_events, -- Renamed to avoid confusion with total_usage_amount
+            SUM(IFNULL(ce.deduct_amount, 0)) as total_revenue,
+            AVG(IFNULL(ce.deduct_amount, 0)) as avg_revenue_per_use,
             DATEDIFF(NOW(), MIN(ce.creation_time)) as days_in_market
         FROM cdr_events ce
         JOIN offers o ON ce.offer_id = o.offer_id
@@ -3151,7 +3124,7 @@ def competitive_analysis():
         RANK() OVER (PARTITION BY product_category ORDER BY unique_users DESC) as user_rank
     FROM performance_benchmarks
     ORDER BY product_category, total_revenue DESC
-    """
+    """)
     df = query_to_dataframe(query)
 
     if df.empty:
@@ -3179,91 +3152,14 @@ def competitive_analysis():
         'chart': create_figure_json(fig)
     })
 
-# --- NEW ROUTE FOR ANALYTICS MODULES ---
 
-
-@app.route('/analytics_modules')
-@login_required
-def analytics_modules_page():
-    """
-    Renders the Analytics Modules dashboard, fetching data from various APIs.
-    """
-    user_role = session.get('role_name')
-
-    # Fetch data from all relevant API endpoints
-    # Use .get('chart', '') to safely retrieve chart data, defaulting to an empty string if None or missing
-    # And .get('data', []) for table data, defaulting to an empty list
-    overall_stats_response = overall_stats().json
-    offers_summary_response = offers_summary().json
-    offer_performance_response = offer_performance().json
-    offer_trend_analysis_response = offer_trend_analysis().json
-    data_bundle_analysis_response = data_bundle_analysis().json
-    cross_offer_analysis_response = cross_offer_analysis().json
-    revenue_analysis_response = revenue_analysis().json
-    revenue_trends_by_customer_type_response = revenue_trends_by_customer_type().json
-    arpu_analysis_response = arpu_analysis().json
-    balance_flow_analysis_response = balance_flow_analysis().json
-    loan_analysis_response = loan_analysis().json
-    operations_breakdown_response = operations_breakdown().json
-    object_types_analysis_response = object_types_analysis().json
-    time_series_analysis_response = time_series_analysis().json
-    usage_patterns_by_time_response = usage_patterns_by_time().json
-    expiry_forecast_response = expiry_forecast().json
-    expiry_impact_analysis_response = expiry_impact_analysis().json
-    network_capacity_analysis_response = network_capacity_analysis().json
-    data_quality_report_response = data_quality_report().json
-    churn_analysis_response = churn_analysis().json
-    churn_risk_analysis_response = churn_risk_analysis().json
-    seasonal_usage_prediction_response = seasonal_usage_prediction().json
-    next_offer_recommendation_response = next_offer_recommendation().json
-    customer_type_distribution_response = customer_type_distribution().json
-    customer_spending_segments_response = customer_spending_segments().json
-    customer_behavior_by_type_response = customer_behavior_by_type().json
-    customer_offer_preferences_response = customer_offer_preferences().json
-    customer_lifecycle_analysis_response = customer_lifecycle_analysis().json
-    customer_journey_analysis_response = customer_journey_analysis().json
-
-
-    return render_template(
-        'analytics_modules.html',
-        user_role=user_role,
-        page_title="Analytics Modules",
-        overall_stats=overall_stats_response,
-        offers_summary=offers_summary_response,
-        offer_performance=offer_performance_response,
-        offer_trend_analysis=offer_trend_analysis_response,
-        data_bundle_analysis=data_bundle_analysis_response,
-        cross_offer_analysis=cross_offer_analysis_response,
-        revenue_analysis=revenue_analysis_response,
-        revenue_trends_by_customer_type=revenue_trends_by_customer_type_response,
-        arpu_analysis=arpu_analysis_response,
-        balance_flow_analysis=balance_flow_analysis_response,
-        loan_analysis=loan_analysis_response,
-        operations_breakdown=operations_breakdown_response,
-        object_types_analysis=object_types_analysis_response,
-        time_series_analysis=time_series_analysis_response,
-        usage_patterns_by_time=usage_patterns_by_time_response,
-        expiry_forecast=expiry_forecast_response,
-        expiry_impact_analysis=expiry_impact_analysis_response,
-        network_capacity_analysis=network_capacity_analysis_response,
-        data_quality_report=data_quality_report_response,
-        churn_analysis=churn_analysis_response,
-        churn_risk_analysis=churn_risk_analysis_response,
-        seasonal_usage_prediction=seasonal_usage_prediction_response,
-        next_offer_recommendation=next_offer_recommendation_response,
-        customer_type_distribution=customer_type_distribution_response,
-        customer_spending_segments=customer_spending_segments_response,
-        customer_behavior_by_type=customer_behavior_by_type_response,
-        customer_offer_preferences=customer_offer_preferences_response,
-        customer_lifecycle_analysis=customer_lifecycle_analysis_response,
-        customer_journey_analysis=customer_journey_analysis_response
-    )
-
+# ==============================================================================
+# 8. APPLICATION RUNNER
+# ==============================================================================
 if __name__ == '__main__':
-    # --- IMPORTANT: Create a first admin user if none exists ---
-    # This function should ideally be called only once during initial setup.
-    # It's here for convenience in development, but manage admin users securely in production.
+    # Initialize the database engine once at startup
+    get_db_engine()
 
-    # --- End of admin creation ---
-
+    # For production, it's recommended to use a WSGI server like Gunicorn or uWSGI
+    # instead of Flask's built-in development server.
     app.run(debug=True, host='0.0.0.0', port=5000)
